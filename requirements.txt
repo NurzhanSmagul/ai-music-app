@@ -1,6 +1,8 @@
 streamlit
 librosa
 soundfile
+numpy
+matplotlib
+pandas
 pillow
 requests
-numpy
