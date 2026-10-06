@@ -51,7 +51,7 @@ def verify_user(username, password):
         return True
     return False
 
-# Кроссплатформенная загрузка шрифта (работает как на Windows, так и на Linux/Streamlit Cloud)
+# Кроссплатформенная загрузка шрифта
 def get_font(size):
     font_paths = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -69,7 +69,7 @@ def get_font(size):
     return ImageFont.load_default()
 
 # Настройка страницы
-st.set_page_config(page_title="NBS SOFT — Pro Multi-Track DAW", page_icon="👑", layout="centered")
+st.set_page_config(page_title="NBS SOFT — Pro Multi-Track DAW & Anti-ID", page_icon="👑", layout="centered")
 
 # Сессия для авторизации
 if "logged_in" not in st.session_state:
@@ -121,8 +121,8 @@ if st.sidebar.button("🚪 Выйти из аккаунта"):
     st.rerun()
 
 # --- ОСНОВНОЙ ФУНКЦИОНАЛ ПРИЛОЖЕНИЯ ---
-st.title("👑 NBS SOFT — Multi-Track DAW & Beat Timeline")
-st.write("Многодорожечная аудиостудия: управление дорожками, таймлайн-сдвиг сэмплов и мастеринг!")
+st.title("👑 NBS SOFT — DAW & Anti-Content ID Shield")
+st.write("Профессиональная многодорожечная студия с защитой спектра от роботов YouTube и Content ID!")
 
 # Загрузка трека
 uploaded_file = st.file_uploader("Загрузите исходный трек (.mp3 или .wav)", type=["mp3", "wav"])
@@ -132,7 +132,7 @@ if uploaded_file is not None:
     with open(audio_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
     
-    st.success("✅ Трек успешно загружен в DAW-студию!")
+    st.success("✅ Трек успешно загружен в студию!")
     
     # Настройки релиза и обложки
     st.subheader("🎨 Настройки релиза и обложки")
@@ -154,49 +154,48 @@ if uploaded_file is not None:
     default_genre_text = genre_category.split(" (")[0]
     genre_text = st.text_input("Текст жанра на обложке", default_genre_text)
 
-    # --- ПАНЕЛЬ ГЛОБАЛЬНЫХ FX ---
-    st.subheader("🎛️ Мастер-секция эффектов (Master FX)")
+    # --- ПАНЕЛЬ ГЛОБАЛЬНЫХ FX & ANTI-ID ---
+    st.subheader("🎛️ Мастер-секция эффектов & Anti-Content ID Shield")
     
     col_fx1, col_fx2 = st.columns(2)
     with col_fx1:
-        pitch_shift = st.slider("🔑 Сдвиг тональности (полутоны)", -5.0, 3.0, -2.0, 0.5)
-        tempo_factor = st.slider("⏱ Скорость (Темп)", 0.70, 1.20, 0.82, 0.01)
+        pitch_shift = st.slider("🔑 Сдвиг тональности (полутоны)", -5.0, 3.0, -2.5, 0.5)
+        tempo_factor = st.slider("⏱ Скорость (Темп)", 0.70, 1.20, 0.80, 0.01)
         trim_start_sec = st.slider("✂ Обрезка старта трека (сек)", 0.0, 1.0, 0.15, 0.05)
     with col_fx2:
-        reverb_mix = st.slider("🌊 Реверберация (Эхо)", 0.0, 1.0, 0.40, 0.05)
-        reverb_delay_ms = st.slider("⏳ Задержка эха (Delay, мс)", 80, 300, 150, 10)
-        vinyl_noise = st.slider("📻 Виниловый шум", 0.0, 0.015, 0.002, 0.001)
+        reverb_mix = st.slider("🌊 Реверберация (Эхо)", 0.0, 1.0, 0.45, 0.05)
+        reverb_delay_ms = st.slider("⏳ Задержка эха (Delay, мс)", 80, 300, 160, 10)
+        vinyl_noise = st.slider("📻 Виниловый/Ленточный шум (Anti-ID)", 0.0, 0.02, 0.003, 0.001)
+
+    # Усиленная защита спектра
+    st.markdown("### 🛡️ Параметры защиты от Content ID (Anti-ID Shield)")
+    col_a1, col_a2 = st.columns(2)
+    with col_a1:
+        enable_harmonic_drive = st.checkbox("🔥 Гармонический сатуратор (Искажение фазы)", value=True)
+        drive_amount = st.slider("Интенсивность сатурации", 1.0, 2.0, 1.25, 0.05)
+    with col_a2:
+        enable_micro_shift = st.checkbox("🧩 Рандомизация спектральных формант", value=True)
+        micro_detune = st.slider("Степень детюна формант", 0.0, 0.15, 0.04, 0.01)
 
     # --- МНОГОДОРОЖЕЧНЫЙ ТАЙМЛАЙН-РЕДАКТОР ---
     st.markdown("---")
     st.subheader("🎚️ Многодорожечный редактор сэмплов (Timeline Lanes)")
-    st.write("Настройте громкость и смещение во времени (сдвиг дорожки) для каждого инструмента:")
-
-    st.markdown("### 🟢 Дорожка 1: Kick (Бочка)")
+    
     col_k1, col_k2 = st.columns(2)
     with col_k1:
         kick_volume = st.slider("Громкость Kick", 0.0, 2.0, 1.0, 0.1, key="k_vol")
+        kick_shift_sec = st.slider("Смещение Kick (сек)", -1.0, 2.0, 0.0, 0.05, key="k_shift")
     with col_k2:
-        kick_shift_sec = st.slider("Смещение Kick по таймлайну (сек)", -1.0, 2.0, 0.0, 0.05, key="k_shift")
-
-    st.markdown("### 🔵 Дорожка 2: Snare (Снейр / Перкуссия)")
-    col_s1, col_s2 = st.columns(2)
-    with col_s1:
         snare_volume = st.slider("Громкость Snare", 0.0, 2.0, 0.8, 0.1, key="s_vol")
-    with col_s2:
-        snare_shift_sec = st.slider("Смещение Snare по таймлайну (сек)", -1.0, 2.0, 0.0, 0.05, key="s_shift")
+        snare_shift_sec = st.slider("Смещение Snare (сек)", -1.0, 2.0, 0.0, 0.05, key="s_shift")
 
-    st.markdown("### 🟣 Дорожка 3: 808 Sub-Bass (Саб-бас)")
-    col_b1, col_b2 = st.columns(2)
-    with col_b1:
-        bass_volume = st.slider("Громкость 808 Bass", 0.0, 2.0, 1.2, 0.1, key="b_vol")
-    with col_b2:
-        bass_shift_sec = st.slider("Смещение Bass по таймлайну (сек)", -1.0, 2.0, 0.0, 0.05, key="b_shift")
+    bass_volume = st.slider("Громкость 808 Sub-Bass", 0.0, 2.0, 1.2, 0.1, key="b_vol")
+    bass_shift_sec = st.slider("Смещение Bass (сек)", -1.0, 2.0, 0.0, 0.05, key="b_shift")
 
-    enable_beats = st.checkbox("✅ Включить воспроизведение добавленных дорожек ударных и баса", value=True)
+    enable_beats = st.checkbox("✅ Включить дорожки ударных и баса", value=True)
 
-    if st.button("🚀 Свести многодорожечный проект и сделать мастеринг"):
-        with st.spinner("🔄 Обработка дорожек, сведение таймлайна и мастеринг..."):
+    if st.button("🚀 Свести трек, применить Anti-ID Shield и мастеринг"):
+        with st.spinner("🛡️ Применяем спектральную защиту, сведение и мастеринг..."):
             try:
                 y, sr = librosa.load(audio_path, sr=None, mono=True)
                 
@@ -222,6 +221,15 @@ if uploaded_file is not None:
                     y = y_padded
 
                 effective_bpm = track_bpm * tempo_factor
+
+                # Анти-ID формантная микро-модуляция спектра
+                if enable_micro_shift and micro_detune > 0:
+                    stft_matrix = librosa.stft(y, n_fft=2048, hop_length=512)
+                    freq_bins = stft_matrix.shape[0]
+                    shift_bins = int(freq_bins * micro_detune * 0.02)
+                    if shift_bins > 0:
+                        shifted_stft = np.roll(stft_matrix, shift_bins, axis=0)
+                        y = librosa.istft(shifted_stft, hop_length=512, length=len(y))
 
                 trim_samples = int(trim_start_sec * sr)
                 if len(y) > trim_samples:
@@ -300,6 +308,10 @@ if uploaded_file is not None:
                 if vinyl_noise > 0:
                     y = y + np.random.normal(0, vinyl_noise, len(y))
 
+                # Анти-ID гармонический сатуратор (перегруз фазы для разрыва хэша роботов)
+                if enable_harmonic_drive:
+                    y = np.tanh(y * drive_amount) / drive_amount
+
                 y = np.tanh(y * 1.15) / 1.15
                 max_val = np.max(np.abs(y))
                 if max_val > 0:
@@ -348,7 +360,7 @@ if uploaded_file is not None:
             cover_image.convert("RGB").save(cover_filename, "PNG")
             st.session_state["ready_cover"] = cover_filename
 
-        st.success(f"🎉 Проект успешно сведен! Новый BPM: **{st.session_state.get('detected_bpm', 120)}**.")
+        st.success(f"🎉 Проект успешно сведен с Anti-ID Shield! Новый BPM: **{st.session_state.get('detected_bpm', 120)}**.")
 
     # --- ОТОБРАЖЕНИЕ РЕЗУЛЬТАТОВ И ТАЙМЛАЙНА ---
     if "ready_cover" in st.session_state and os.path.exists(st.session_state["ready_cover"]):
@@ -360,24 +372,21 @@ if uploaded_file is not None:
             st.download_button("📥 Скачать обложку (PNG)", img_file, file_name="youtube_cover.png", mime="image/png")
 
     if "ready_audio" in st.session_state and os.path.exists(st.session_state["ready_audio"]):
-        st.markdown(f"🎵 **Прослушать готовый многодорожечный трек (BPM: {st.session_state.get('detected_bpm', 'Auto')}):**")
+        st.markdown(f"🎵 **Прослушать готовый трек с Anti-ID Shield (BPM: {st.session_state.get('detected_bpm', 'Auto')}):**")
         st.audio(st.session_state["ready_audio"], format="audio/wav")
         
         with open(st.session_state["ready_audio"], "rb") as aud_file:
-            st.download_button("📥 Скачать трек в HQ (WAV)", aud_file, file_name="remixed_track.wav", mime="audio/wav")
+            st.download_button("📥 Скачать трек в HQ (WAV)", aud_file, file_name="remixed_track.wav", mime="image/wav")
 
-        # --- ТАЙМЛАЙН РЕДАКТОР ---
         if "timeline_events" in st.session_state and st.session_state["timeline_events"]:
             st.markdown("---")
             st.subheader("🎚️ Таймлайн-редактор: Сводка дорожек")
-            st.write("Точные позиции сэмплов с учетом примененных смещений:")
-            
             df_timeline = pd.DataFrame(st.session_state["timeline_events"])
             st.dataframe(df_timeline, use_container_width=True)
 
         # --- YOUTUBE SEO ---
         st.markdown("---")
-        st.subheader("🚀 YouTube SEO Оптимизация (Названия, Описание, Теги)")
+        st.subheader("🚀 YouTube SEO Оптимизация")
         
         clean_title_slug = song_title.replace(" ", "")
         genre_slug = default_genre_text.split(" ")[0]
@@ -395,7 +404,7 @@ if uploaded_file is not None:
         yt_description = f"""🎵 Artist: {artist_name}
 🎧 Track: {song_title}
 ✨ Version: {default_genre_text}
-⚡ Powered by NBS SOFT Studio
+⚡ Powered by NBS SOFT Studio (Anti-ID Protected)
 
 Immerse yourself in the ultimate atmosphere. Enjoy the vibe, drop a like, and subscribe for more daily releases!
 
