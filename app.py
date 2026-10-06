@@ -140,8 +140,8 @@ if uploaded_file is not None:
     genre_category = st.selectbox(
         "🎵 Музыкальный стиль / Направление",
         [
-            "SLOWED & REVERB (Глубокий атмосферный вайб)",
             "PHONK / DRIFT PHONK (Качающий бас и темный звук)",
+            "SLOWED & REVERB (Глубокий атмосферный вайб)",
             "LO-FI / CHILL BEATS (Мягкий винтажный звук)",
             "NIGHTCORE / HIGH SPEED (Энергичный ускоренный вайб)",
             "SYNTHWAVE / RETRO 80s (Космическая атмосфера)"
