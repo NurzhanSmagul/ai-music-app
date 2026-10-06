@@ -164,7 +164,7 @@ if uploaded_file is not None:
     if st.button("🚀 Обработать трек и изменить звучание"):
         
         # --- ОБРАБОТКА АУДИО БЕЗ КЛИППИНГА И ИСКАЖЕНИЙ ---
-        with st.spinner("🔄 Применяем глубокую пересборку аудио, мастеринг и ударные..."):
+        with st.spinner("🔄 Применяем глубокую пересборку аудио, мастеринг и устранение артефактов..."):
             try:
                 # Загружаем трек
                 y, sr = librosa.load(audio_path, sr=None, mono=True)
@@ -209,6 +209,11 @@ if uploaded_file is not None:
 
                     for i, frame in enumerate(adjusted_frames):
                         idx = int(frame)
+                        
+                        # Пропускаем первые удары, если они попадают на самые начальные миллисекунды (защита от кликов на старте)
+                        if idx < int(sr * 0.15):
+                            continue
+                            
                         timestamp_sec = round(idx / sr, 2)
                         
                         if idx + len(kick_wave) < len(mixed):
@@ -244,10 +249,16 @@ if uploaded_file is not None:
                     noise = np.random.normal(0, vinyl_noise, len(y))
                     y = y + noise
 
-                # --- ПРОФЕССИОНАЛЬНЫЙ МАСТЕРИНГ И МЯГКИЙ ЛИМИТЕР (ЗАЩИТА ОТ ТРЕСКА / «ТЫЫЫЗ») ---
+                # --- 8. ЗАЩИТА СТАРТА: Плавный Fade-In в самом начале трека (50 мс) ---
+                fade_samples = int(sr * 0.05)
+                if len(y) > fade_samples:
+                    fade_curve = np.linspace(0.0, 1.0, fade_samples)
+                    y[:fade_samples] = y[:fade_samples] * fade_curve
+
+                # --- ПРОФЕССИОНАЛЬНЫЙ МАСТЕРИНГ И МЯГКИЙ ЛИМИТЕР ---
                 y = np.tanh(y * 1.15) / 1.15
 
-                # Финальная чистая нормализация громкости (0.92 (-0.7 dB) — идеальный стандарт для HQ аудио)
+                # Финальная чистая нормализация громкости (0.92 (-0.7 dB))
                 max_val = np.max(np.abs(y))
                 if max_val > 0:
                     y = y / max_val * 0.92
@@ -317,47 +328,4 @@ if uploaded_file is not None:
         # --- ТАЙМЛАЙН РЕДАКТОР ---
         if "timeline_events" in st.session_state and st.session_state["timeline_events"]:
             st.markdown("---")
-            st.subheader("🎚️ Таймлайн-редактор: Моменты добавления ударных")
-            st.write("Ниже показана точная сетка времени (в секундах), куда были внедрены удары бочки и перкуссии:")
-            
-            df_timeline = pd.DataFrame(st.session_state["timeline_events"])
-            st.dataframe(df_timeline, use_container_width=True)
-
-        # --- YOUTUBE SEO ---
-        st.markdown("---")
-        st.subheader("🚀 YouTube SEO Оптимизация (Названия, Описание, Теги)")
-        
-        clean_title_slug = song_title.replace(" ", "")
-        genre_slug = default_genre_text.split(" ")[0]
-
-        yt_titles = [
-            f"{song_title} [{default_genre_text} / HQ Audio] | NBS SOFT",
-            f"{artist_name} - {song_title} (Slowed & Reverb / Bass Boosted)",
-            f"{song_title} — {default_genre_text} (Vibe Edition)"
-        ]
-        
-        st.markdown("**💡 1. Оптимизированные названия:**")
-        for t in yt_titles:
-            st.code(t, language="text")
-
-        yt_description = f"""🎵 Artist: {artist_name}
-🎧 Track: {song_title}
-✨ Version: {default_genre_text}
-⚡ Powered by NBS SOFT Studio
-
-Immerse yourself in the ultimate atmosphere. Enjoy the vibe, drop a like, and subscribe for more daily releases!
-
-📌 Support & Links:
-• Telegram Channel: Link in Bio
-• Stream / Download: Available on all platforms
-
-#️⃣ Tags & Hashtags:
-#{clean_title_slug} #{genre_slug} #SlowedAndReverb #Phonk #BassBoosted #MusicVibes #Audio #NBSSoft #TrendingMusic
-"""
-        st.markdown("**📝 2. Полное SEO-описание для видео:**")
-        st.text_area("Скопируйте описание:", yt_description, height=160)
-
-        youtube_tags = f"{song_title}, {artist_name}, {song_title} slowed, {song_title} reverb, {default_genre_text}, phonk, bass boosted, chill music, aesthetic music, slowed and reverb songs, nbs soft, audio edit, remix, tiktok music, youtube shorts music, 8d audio, nightcore"
-        
-        st.markdown("**🏷️ 3. Теги для YouTube Studio:**")
-        st.code(youtube_tags, language="text")
+            st.subheader("
