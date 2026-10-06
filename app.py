@@ -52,7 +52,7 @@ def verify_user(username, password):
     return False
 
 # Настройка страницы
-st.set_page_config(page_title="NBS SOFT — AI Music & BPM Sync Studio", page_icon="👑", layout="centered")
+st.set_page_config(page_title="NBS SOFT — AI Music & Beat Studio", page_icon="👑", layout="centered")
 
 # Сессия для авторизации
 if "logged_in" not in st.session_state:
@@ -63,7 +63,7 @@ if "username" not in st.session_state:
 # --- ЭКРАН АВТОРИЗАЦИИ / РЕГИСТРАЦИИ ---
 if not st.session_state["logged_in"]:
     st.title("🔐 NBS SOFT — Вход в платформу")
-    st.write("Войдите в систему для доступа к студии с синхронизацией BPM и SEO.")
+    st.write("Войдите в систему для доступа к студии с синхронизацией ударных и SEO.")
     
     tab1, tab2 = st.tabs(["🔑 Вход", "📝 Регистрация"])
     
@@ -104,8 +104,8 @@ if st.sidebar.button("🚪 Выйти из аккаунта"):
     st.rerun()
 
 # --- ОСНОВНОЙ ФУНКЦИОНАЛ ПРИЛОЖЕНИЯ ---
-st.title("👑 NBS SOFT — BPM Sync & Anti-ID Studio")
-st.write("Автоматическое определение BPM, синхронизация ритмов, HQ обработка и генерация SEO!")
+st.title("👑 NBS SOFT — Beat Sync & Anti-ID Studio")
+st.write("Автоматическое наложение мощных ударных по сетке BPM, HQ обработка и генерация SEO!")
 
 # Загрузка трека
 uploaded_file = st.file_uploader("Загрузите исходный трек (.mp3 или .wav)", type=["mp3", "wav"])
@@ -138,58 +138,89 @@ if uploaded_file is not None:
     genre_text = st.text_input("Текст жанра на обложке", default_genre_text)
 
     # --- ПАНЕЛЬ НАСТРОЙКИ КАЧЕСТВА И ЭФФЕКТОВ ---
-    st.subheader("🎛️ Студийный FX Rack & BPM Синхронизация")
+    st.subheader("🎛️ Студийный FX Rack & Наложение ударных")
     
     col_fx1, col_fx2 = st.columns(2)
     with col_fx1:
         pitch_shift = st.slider("🔑 Сдвиг тональности (для обхода ID)", -4.0, 2.0, -1.5, 0.5)
-        tempo_factor = st.slider("⏱️️ Скорость (Темп)", 0.75, 1.10, 0.88, 0.01)
-        bass_boost_gain = st.slider("🔊 Усиление баса (Bass Boost)", 0.0, 2.0, 0.7, 0.1)
+        tempo_factor = st.slider("⏱ Скорость (Темп)", 0.75, 1.10, 0.88, 0.01)
+        bass_boost_gain = st.slider("🔊 Усиление баса (Bass Boost)", 0.0, 2.0, 0.8, 0.1)
     with col_fx2:
         reverb_mix = st.slider("🌊 Интенсивность эха / Реверберации", 0.0, 1.0, 0.40, 0.05)
         reverb_delay_ms = st.slider("⏳ Задержка эха (Delay, мс)", 60, 250, 120, 10)
         vinyl_noise = st.slider("📻 Плотность шума винила / Анти-ID фактора", 0.0, 0.015, 0.003, 0.001)
 
     selected_beat_layer = st.selectbox(
-        "🎶 Дополнительный синхронизированный бит / вайб",
+        "🎶 Выбор дополнительных ударных и бита",
         [
             "Нет (Чистая обработка исходника)",
-            "Drift Phonk Beat (Строго по BPM трека)",
-            "Lo-Fi Vinyl & Rain Rhythm (Мягкий грув)",
-            "Cyberpunk Bass Pulse (Ритмичный пульс под BPM)"
+            "Drift Phonk Heavy Kick (Мощные басовые бочки по BPM)",
+            "Lo-Fi Chill Drums (Мягкий кач и перкуссия)",
+            "Cyberpunk Electronic Beat (Плотный электронный ритм)"
         ]
     )
 
-    if st.button("🚀 Запустить BPM-синхронизацию, HQ звук и SEO"):
+    if st.button("🚀 Запустить добавление ударных, HQ звук и SEO"):
         
-        # --- ОБРАБОТКА АУДИО И СИНХРОНИЗАЦИЯ BPM ---
-        with st.spinner("🔄 Анализируем BPM трека, синхронизируем ритм и обрабатываем звук..."):
+        # --- ОБРАБОТКА АУДИО И ДОБАВЛЕНИЕ УДАРНЫХ ПО СЕТКЕ BPM ---
+        with st.spinner("🔄 Анализируем доли трека, генерируем и встраиваем ударные по BPM..."):
             try:
                 y, sr = librosa.load(audio_path, sr=None, mono=True)
                 
-                # 1. Автоматический расчет BPM исходного трека
-                tempo_detected, _ = librosa.beat.beat_track(y=y, sr=sr)
+                # 1. Автоматический поиск долей (Beat Tracking)
+                tempo_detected, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
                 if isinstance(tempo_detected, np.ndarray):
                     track_bpm = float(tempo_detected[0])
                 else:
                     track_bpm = float(tempo_detected)
                 
-                # Применяем сдвиг питча и темпа
+                # Применяем питч и темп
                 if pitch_shift != 0.0:
                     y = librosa.effects.pitch_shift(y, sr=sr, n_steps=pitch_shift, n_fft=2048, hop_length=512)
                 
                 if tempo_factor != 1.0:
                     y = librosa.effects.time_stretch(y, rate=tempo_factor)
                 
-                # Скорректированный BPM с учетом изменения скорости
                 effective_bpm = track_bpm * tempo_factor
 
-                # 2. Бас-буст
+                # 2. Добавление мощных синтезированных ударных строго по позициям долей
+                if selected_beat_layer != "Нет":
+                    mixed = y.copy()
+                    
+                    # Генерация параметров бочки (Kick)
+                    kick_dur = 0.14
+                    t_kick = np.linspace(0, kick_dur, int(sr * kick_dur))
+                    freq_start = 160 if "Phonk" in selected_beat_layer else 120
+                    freq_sweep = np.linspace(freq_start, 35, len(t_kick))
+                    kick_wave = np.sin(2 * np.pi * freq_sweep * t_kick) * np.exp(-6 * t_kick) * 0.65
+
+                    # Генерация снеира/хайхета для объема
+                    snare_dur = 0.08
+                    t_snare = np.linspace(0, snare_dur, int(sr * snare_dur))
+                    snare_wave = np.random.normal(0, 1, len(t_snare)) * np.exp(-15 * t_snare) * 0.35
+
+                    # Конвертируем фреймы с учетом тайм-стретчинга
+                    adjusted_frames = (beat_frames / tempo_factor).astype(int)
+
+                    for i, frame in enumerate(adjusted_frames):
+                        idx = int(frame)
+                        # Добавляем бочку на каждый удар
+                        if idx + len(kick_wave) < len(mixed):
+                            mixed[idx:idx + len(kick_wave)] += kick_wave
+                        
+                        # Добавляем снеир на каждый второй удар для плотности кача
+                        if i % 2 == 1 and "Phonk" in selected_beat_layer:
+                            if idx + len(snare_wave) < len(mixed):
+                                mixed[idx:idx + len(snare_wave)] += snare_wave
+
+                    y = mixed
+
+                # 3. Бас-буст
                 if bass_boost_gain > 0:
                     y_bass = librosa.effects.pitch_shift(y, sr=sr, n_steps=-12)
-                    y = y + (y_bass * bass_boost_gain * 0.4)
+                    y = y + (y_bass * bass_boost_gain * 0.45)
 
-                # 3. Эхо и реверберация
+                # 4. Эхо и реверберация
                 if reverb_mix > 0:
                     delay_samples = int(sr * (reverb_delay_ms / 1000.0))
                     reverb_signal = np.zeros_like(y)
@@ -197,28 +228,10 @@ if uploaded_file is not None:
                         reverb_signal[delay_samples:] = y[:-delay_samples] * reverb_mix
                         y = y + reverb_signal
 
-                # 4. Шум винила
+                # 5. Шум винила
                 if vinyl_noise > 0:
                     noise = np.random.normal(0, vinyl_noise, len(y))
                     y = y + noise
-
-                # 5. СТРОГО СИНХРОНИЗИРОВАННЫЙ ПО BPM ФОНОВЫЙ РИТМ
-                if selected_beat_layer != "Нет":
-                    t = np.linspace(0, len(y)/sr, len(y))
-                    # Точная частота ударов в секунду (Hz) на основе измеренного BPM
-                    beat_freq = effective_bpm / 60.0
-                    
-                    if "Phonk" in selected_beat_layer:
-                        # Качающий саб-бас и акценты строго по долям BPM
-                        bpm_pulse = np.abs(np.sin(2 * np.pi * beat_freq * t)) ** 3 * 0.22
-                        y = y + (bpm_pulse * y)
-                    elif "Rain" in selected_beat_layer:
-                        rain_noise = np.random.normal(0, 0.008, len(y))
-                        rhythmic_mod = (0.8 + 0.2 * np.sin(2 * np.pi * beat_freq * t))
-                        y = y + (rain_noise * rhythmic_mod)
-                    elif "Cyberpunk" in selected_beat_layer:
-                        synth_pulse = np.sin(2 * np.pi * (beat_freq * 2) * t) * 0.14
-                        y = y + synth_pulse
 
                 # Нормализация громкости (HQ Limiter)
                 max_val = max(abs(y.min()), abs(y.max()))
@@ -269,7 +282,7 @@ if uploaded_file is not None:
             cover_image.convert("RGB").save(cover_filename, "PNG")
             st.session_state["ready_cover"] = cover_filename
 
-        st.success(f"🎉 Готово! Трек обработан. Определенный BPM: **{st.session_state.get('detected_bpm', 120)}**")
+        st.success(f"🎉 Готово! Ударные успешно встроены. Определенный BPM: **{st.session_state.get('detected_bpm', 120)}**")
 
     # --- ОТОБРАЖЕНИЕ РЕЗУЛЬТАТОВ ---
     if "ready_cover" in st.session_state and os.path.exists(st.session_state["ready_cover"]):
