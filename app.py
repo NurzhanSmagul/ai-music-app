@@ -245,8 +245,6 @@ if uploaded_file is not None:
                     y = y + noise
 
                 # --- ПРОФЕССИОНАЛЬНЫЙ МАСТЕРИНГ И МЯГКИЙ ЛИМИТЕР (ЗАЩИТА ОТ ТРЕСКА / «ТЫЫЫЗ») ---
-                # Применяем функцию tanh (soft clipping), которая убирает цифровые щелчки и искажения, 
-                # сохраняя максимальную плотность и громкость трека.
                 y = np.tanh(y * 1.15) / 1.15
 
                 # Финальная чистая нормализация громкости (0.92 (-0.7 dB) — идеальный стандарт для HQ аудио)
@@ -311,4 +309,55 @@ if uploaded_file is not None:
 
     if "ready_audio" in st.session_state and os.path.exists(st.session_state["ready_audio"]):
         st.markdown(f"🎵 **Прослушать обработанный трек (BPM: {st.session_state.get('detected_bpm', 'Auto')}):**")
-        st.audio(st.session
+        st.audio(st.session_state["ready_audio"], format="audio/wav")
+        
+        with open(st.session_state["ready_audio"], "rb") as aud_file:
+            st.download_button("📥 Скачать трек в HQ (WAV)", aud_file, file_name="remixed_track.wav", mime="audio/wav")
+
+        # --- ТАЙМЛАЙН РЕДАКТОР ---
+        if "timeline_events" in st.session_state and st.session_state["timeline_events"]:
+            st.markdown("---")
+            st.subheader("🎚️ Таймлайн-редактор: Моменты добавления ударных")
+            st.write("Ниже показана точная сетка времени (в секундах), куда были внедрены удары бочки и перкуссии:")
+            
+            df_timeline = pd.DataFrame(st.session_state["timeline_events"])
+            st.dataframe(df_timeline, use_container_width=True)
+
+        # --- YOUTUBE SEO ---
+        st.markdown("---")
+        st.subheader("🚀 YouTube SEO Оптимизация (Названия, Описание, Теги)")
+        
+        clean_title_slug = song_title.replace(" ", "")
+        genre_slug = default_genre_text.split(" ")[0]
+
+        yt_titles = [
+            f"{song_title} [{default_genre_text} / HQ Audio] | NBS SOFT",
+            f"{artist_name} - {song_title} (Slowed & Reverb / Bass Boosted)",
+            f"{song_title} — {default_genre_text} (Vibe Edition)"
+        ]
+        
+        st.markdown("**💡 1. Оптимизированные названия:**")
+        for t in yt_titles:
+            st.code(t, language="text")
+
+        yt_description = f"""🎵 Artist: {artist_name}
+🎧 Track: {song_title}
+✨ Version: {default_genre_text}
+⚡ Powered by NBS SOFT Studio
+
+Immerse yourself in the ultimate atmosphere. Enjoy the vibe, drop a like, and subscribe for more daily releases!
+
+📌 Support & Links:
+• Telegram Channel: Link in Bio
+• Stream / Download: Available on all platforms
+
+#️⃣ Tags & Hashtags:
+#{clean_title_slug} #{genre_slug} #SlowedAndReverb #Phonk #BassBoosted #MusicVibes #Audio #NBSSoft #TrendingMusic
+"""
+        st.markdown("**📝 2. Полное SEO-описание для видео:**")
+        st.text_area("Скопируйте описание:", yt_description, height=160)
+
+        youtube_tags = f"{song_title}, {artist_name}, {song_title} slowed, {song_title} reverb, {default_genre_text}, phonk, bass boosted, chill music, aesthetic music, slowed and reverb songs, nbs soft, audio edit, remix, tiktok music, youtube shorts music, 8d audio, nightcore"
+        
+        st.markdown("**🏷️ 3. Теги для YouTube Studio:**")
+        st.code(youtube_tags, language="text")
