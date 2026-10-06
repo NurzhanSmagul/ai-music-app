@@ -7,7 +7,6 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 import librosa
 import soundfile as sf
 import numpy as np
-import matplotlib.pyplot as plt
 import sqlite3
 import hashlib
 import pandas as pd
@@ -53,7 +52,7 @@ def verify_user(username, password):
     return False
 
 # Настройка страницы
-st.set_page_config(page_title="NBS SOFT — Pro Multi-Track DAW Session", page_icon="👑", layout="wide")
+st.set_page_config(page_title="NBS SOFT — Pro Multi-Track DAW", page_icon="👑", layout="centered")
 
 # Сессия для авторизации
 if "logged_in" not in st.session_state:
@@ -63,11 +62,12 @@ if "username" not in st.session_state:
 
 # --- ЭКРАН АВТОРИЗАЦИИ / РЕГИСТРАЦИИ ---
 if not st.session_state["logged_in"]:
-    st.title("🔐 NBS SOFT — Вход в многодорожечную студию")
-    st.write("Войдите в систему для доступа к DAW-сессии.")
+    st.title("🔐 NBS SOFT — Вход в студию")
+    st.write("Войдите в систему для доступа к многодорожечной DAW.")
     
-    col_l1, col_l2 = st.columns(2)
-    with col_l1:
+    tab1, tab2 = st.tabs(["🔑 Вход", "📝 Регистрация"])
+    
+    with tab1:
         login_user = st.text_input("Логин", key="login_u")
         login_pass = st.text_input("Пароль", type="password", key="login_p")
         if st.button("Войти в систему"):
@@ -79,313 +79,306 @@ if not st.session_state["logged_in"]:
             else:
                 st.error("Неверный логин или пароль")
                 
-    with col_l2:
+    with tab2:
         reg_user = st.text_input("Придумайте логин", key="reg_u")
         reg_pass = st.text_input("Придумайте пароль", type="password", key="reg_p")
         if st.button("Зарегистрироваться"):
             if reg_user and reg_pass:
                 if register_user(reg_user, reg_pass):
-                    st.success("Регистрация успешна! Войдите слева.")
+                    st.success("Регистрация успешна! Перейдите во вкладку «Вход».")
                 else:
-                    st.error("Логин уже занят.")
+                    st.error("Такой логин уже занят.")
             else:
                 st.warning("Заполните все поля.")
     
     st.stop()
 
-# --- БОКОВАЯ ПАНЕЛЬ ---
+# --- БОКОВАЯ ПАНЕЛЬ С БРЕНДИНГОМ ---
 if os.path.exists("logo_cropped.png"):
     st.sidebar.image("logo_cropped.png", use_container_width=True)
 st.sidebar.markdown("---")
 st.sidebar.write(f"👤 Аккаунт: **{st.session_state['username']}**")
-if st.sidebar.button("🚪 Выйти"):
+if st.sidebar.button("🚪 Выйти из аккаунта"):
     st.session_state["logged_in"] = False
     st.session_state["username"] = ""
     st.rerun()
 
-# --- ОСНОВНОЙ ИНТЕРФЕЙС DAW ---
-st.title("👑 NBS SOFT — Multi-Track DAW Session (Audition / FL Style)")
-st.write("Многодорожечная сессия с визуализацией форм волны (Waveforms), таймлайном и независимым сдвигом треков.")
+# --- ОСНОВНОЙ ФУНКЦИОНАЛ ПРИЛОЖЕНИЯ ---
+st.title("👑 NBS SOFT — Multi-Track DAW & Beat Timeline")
+st.write("Многодорожечная аудиостудия: управление дорожками, таймлайн-сдвиг сэмплов и мастеринг!")
 
-# Секция релизов
-st.subheader("🎨 Настройки релиза и обложки")
-col_meta1, col_meta2, col_meta3 = st.columns(3)
-with col_meta1:
-    song_title = st.text_input("Название трека", "I WELCOME OCTOBER")
-with col_meta2:
-    artist_name = st.text_input("Артист", "Smagulov & Zhaken")
-with col_meta3:
+# Загрузка трека
+uploaded_file = st.file_uploader("Загрузите исходный трек (.mp3 или .wav)", type=["mp3", "wav"])
+
+if uploaded_file is not None:
+    audio_path = "input_track.mp3"
+    with open(audio_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    
+    st.success("✅ Трек успешно загружен в DAW-студию!")
+    
+    # Настройки релиза и обложки
+    st.subheader("🎨 Настройки релиза и обложки")
+    
     genre_category = st.selectbox(
-        "Стиль",
-        ["SLOWED & REVERB", "PHONK / DRIFT", "LO-FI BEATS", "NIGHTCORE", "SYNTHWAVE"]
+        "🎵 Музыкальный стиль / Направление",
+        [
+            "SLOWED & REVERB (Глубокий атмосферный вайб)",
+            "PHONK / DRIFT PHONK (Качающий бас и темный звук)",
+            "LO-FI / CHILL BEATS (Мягкий винтажный звук)",
+            "NIGHTCORE / HIGH SPEED (Энергичный ускоренный вайб)",
+            "SYNTHWAVE / RETRO 80s (Космическая атмосфера)"
+        ]
     )
+    
+    song_title = st.text_input("Название трека", "I WELCOME OCTOBER")
+    artist_name = st.text_input("Имя автора / Артиста", "Smagulov & Zhaken")
+    
+    default_genre_text = genre_category.split(" (")[0]
+    genre_text = st.text_input("Текст жанра на обложке", default_genre_text)
 
-st.markdown("---")
-st.subheader("🎚️ Редактор сессии: Дорожки (Tracks)")
+    # --- ПАНЕЛЬ ГЛОБАЛЬНЫХ FX ---
+    st.subheader("🎛️ Мастер-секция эффектов (Master FX)")
+    
+    col_fx1, col_fx2 = st.columns(2)
+    with col_fx1:
+        pitch_shift = st.slider("🔑 Сдвиг тональности (полутоны)", -5.0, 3.0, -2.0, 0.5)
+        tempo_factor = st.slider("⏱ Скорость (Темп)", 0.70, 1.20, 0.82, 0.01)
+        trim_start_sec = st.slider("✂️️ Обрезка старта трека (сек)", 0.0, 1.0, 0.15, 0.05)
+    with col_fx2:
+        reverb_mix = st.slider("🌊 Реверберация (Эхо)", 0.0, 1.0, 0.40, 0.05)
+        reverb_delay_ms = st.slider("⏳ Задержка эха (Delay, мс)", 80, 300, 150, 10)
+        vinyl_noise = st.slider("📻 Виниловый шум", 0.0, 0.015, 0.002, 0.001)
 
-# --- УПРАВЛЕНИЕ ДОРОЖКАМИ СЕССИИ (TRACK 1, TRACK 2, TRACK 3) ---
-col_tr1, col_tr2, col_tr3 = st.columns(3)
+    # --- МНОГОДОРОЖЕЧНЫЙ ТАЙМЛАЙН-РЕДАКТОР ---
+    st.markdown("---")
+    st.subheader("🎚️ Многодорожечный редактор сэмплов (Timeline Lanes)")
+    st.write("Настройте громкость и смещение во времени (сдвиг дорожки) для каждого инструмента:")
 
-with col_tr1:
-    st.markdown("### 🟢 Track 1 (Основной трек)")
-    file_t1 = st.file_uploader("Загрузить аудио для Track 1 (.mp3 / .wav)", type=["mp3", "wav"], key="f_t1")
-    vol_t1 = st.slider("Громкость Trk 1", 0.0, 2.0, 1.0, 0.1, key="v_t1")
-    shift_t1 = st.slider("Сдвиг Trk 1 (сек)", -2.0, 5.0, 0.0, 0.05, key="s_t1")
-    pitch_t1 = st.slider("Питч Trk 1", -5.0, 3.0, -2.0, 0.5, key="p_t1")
+    st.markdown("### 🟢 Дорожка 1: Kick (Бочка)")
+    col_k1, col_k2 = st.columns(2)
+    with col_k1:
+        kick_volume = st.slider("Громкость Kick", 0.0, 2.0, 1.0, 0.1, key="k_vol")
+    with col_k2:
+        kick_shift_sec = st.slider("Смещение Kick по таймлайну (сек)", -1.0, 2.0, 0.0, 0.05, key="k_shift")
 
-with col_tr2:
-    st.markdown("### 🔵 Track 2 (Бочка / Бас)")
-    file_t2 = st.file_uploader("Загрузить аудио для Track 2 (.mp3 / .wav)", type=["mp3", "wav"], key="f_t2")
-    vol_t2 = st.slider("Громкость Trk 2", 0.0, 2.0, 1.2, 0.1, key="v_t2")
-    shift_t2 = st.slider("Сдвиг Trk 2 (сек)", -2.0, 5.0, 0.0, 0.05, key="s_t2")
-    use_synth_kick = st.checkbox("Использовать синтезированный Kick/Bass", value=True, key="syn_k")
+    st.markdown("### 🔵 Дорожка 2: Snare (Снейр / Перкуссия)")
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        snare_volume = st.slider("Громкость Snare", 0.0, 2.0, 0.8, 0.1, key="s_vol")
+    with col_s2:
+        snare_shift_sec = st.slider("Смещение Snare по таймлайну (сек)", -1.0, 2.0, 0.0, 0.05, key="s_shift")
 
-with col_tr3:
-    st.markdown("### 🟣 Track 3 (Снейр / Перкуссия)")
-    file_t3 = st.file_uploader("Загрузить аудио для Track 3 (.mp3 / .wav)", type=["mp3", "wav"], key="f_t3")
-    vol_t3 = st.slider("Громкость Trk 3", 0.0, 2.0, 0.9, 0.1, key="v_t3")
-    shift_t3 = st.slider("Сдвиг Trk 3 (сек)", -2.0, 5.0, 0.0, 0.05, key="s_t3")
-    use_synth_snare = st.checkbox("Использовать синтезированный Snare", value=True, key="syn_s")
+    st.markdown("### 🟣 Дорожка 3: 808 Sub-Bass (Саб-бас)")
+    col_b1, col_b2 = st.columns(2)
+    with col_b1:
+        bass_volume = st.slider("Громкость 808 Bass", 0.0, 2.0, 1.2, 0.1, key="b_vol")
+    with col_b2:
+        bass_shift_sec = st.slider("Смещение Bass по таймлайну (сек)", -1.0, 2.0, 0.0, 0.05, key="b_shift")
 
-st.markdown("---")
-st.subheader("🎛️ Мастер-эффекты сессии (Master FX)")
-col_fx1, col_fx2 = st.columns(2)
-with col_fx1:
-    tempo_factor = st.slider("⏱ Общая скорость (Темп / Stretch)", 0.70, 1.20, 0.82, 0.01)
-    trim_start_sec = st.slider("✂️ Обрезка старта (Анти-артефакт «тыыыз»)", 0.0, 1.0, 0.15, 0.05)
-with col_fx2:
-    reverb_mix = st.slider("🌊 Реверберация (Эхо)", 0.0, 1.0, 0.40, 0.05)
-    vinyl_noise = st.slider("📻 Виниловый шум", 0.0, 0.015, 0.002, 0.001)
+    enable_beats = st.checkbox("✅ Включить воспроизведение добавленных дорожек ударных и баса", value=True)
 
-if st.button("🚀 Свести все дорожки в единую сессию (Master Mix)"):
-    if file_t1 is None and not use_synth_kick:
-        st.warning("Загрузите хотя бы аудиофайл для Track 1.")
-    else:
-        with st.spinner("🔄 Рендеринг многодорожечной сессии, выравнивание таймлайна и мастеринг..."):
+    if st.button("🚀 Свести многодорожечный проект и сделать мастеринг"):
+        with st.spinner("🔄 Обработка дорожек, сведение таймлайна и мастеринг..."):
             try:
-                sr = 44100
+                y, sr = librosa.load(audio_path, sr=None, mono=True)
                 
-                # Загрузка и обработка Track 1
-                y1 = np.array([])
-                if file_t1 is not None:
-                    path1 = "temp_t1.mp3"
-                    with open(path1, "wb") as f:
-                        f.write(file_t1.getbuffer())
-                    y1, sr = librosa.load(path1, sr=sr, mono=True)
+                tempo_detected, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+                if isinstance(tempo_detected, np.ndarray):
+                    track_bpm = float(tempo_detected[0])
                 else:
-                    y1 = np.zeros(sr * 10) # 10 секунд тишины если пустой
+                    track_bpm = float(tempo_detected)
                 
-                # Защита от артефактов
                 pad_len = int(sr * 1.0)
-                y1_padded = np.pad(y1, (pad_len, pad_len), mode='constant')
-                if pitch_t1 != 0.0:
-                    y1_padded = librosa.effects.pitch_shift(y1_padded, sr=sr, n_steps=pitch_t1)
+                y_padded = np.pad(y, (pad_len, pad_len), mode='constant')
+
+                if pitch_shift != 0.0:
+                    y_padded = librosa.effects.pitch_shift(y_padded, sr=sr, n_steps=pitch_shift, n_fft=2048, hop_length=512)
+                
                 if tempo_factor != 1.0:
-                    y1_padded = librosa.effects.time_stretch(y1_padded, rate=tempo_factor)
+                    y_padded = librosa.effects.time_stretch(y_padded, rate=tempo_factor)
                 
                 effective_pad = int(pad_len * (1.0 / tempo_factor))
-                if len(y1_padded) > 2 * effective_pad:
-                    y1 = y1_padded[effective_pad : -effective_pad]
+                if len(y_padded) > 2 * effective_pad:
+                    y = y_padded[effective_pad : -effective_pad]
                 else:
-                    y1 = y1_padded
+                    y = y_padded
 
-                # Обрезка старта
-                trim_samples = int(trim_start_sec * sr)
-                if len(y1) > trim_samples:
-                    y1 = y1[trim_samples:]
-                
-                # Нормализация
-                if len(y1) > 0 and np.max(np.abs(y1)) > 0:
-                    y1 = y1 / np.max(np.abs(y1)) * 0.7 * vol_t1
-
-                # Анализ BPM для ритм-дорожек
-                tempo_detected, beat_frames = librosa.beat.beat_track(y=y1 if len(y1)>0 else np.zeros(sr), sr=sr)
-                track_bpm = float(tempo_detected[0]) if isinstance(tempo_detected, np.ndarray) else float(tempo_detected)
                 effective_bpm = track_bpm * tempo_factor
 
-                # Определяем максимальную длину микса
-                max_len = len(y1) + int(5.0 * sr)
-                master_mix = np.zeros(max_len)
+                trim_samples = int(trim_start_sec * sr)
+                if len(y) > trim_samples:
+                    y = y[trim_samples:]
 
-                # Микшируем Track 1 с учетом сдвига
-                shift1_samples = int(shift_t1 * sr)
-                start_idx1 = max(0, shift1_samples)
-                end_idx1 = start_idx1 + len(y1)
-                if end_idx1 > len(master_mix):
-                    master_mix = np.pad(master_mix, (0, end_idx1 - len(master_mix)), mode='constant')
-                master_mix[start_idx1:end_idx1] += y1
+                fade_samples = int(sr * 0.05)
+                if len(y) > fade_samples:
+                    y[:fade_samples] = y[:fade_samples] * np.linspace(0.0, 1.0, fade_samples)
 
-                # Загрузка или генерация Track 2 (Kick / Bass)
-                y2 = np.array([])
-                if file_t2 is not None:
-                    path2 = "temp_t2.mp3"
-                    with open(path2, "wb") as f:
-                        f.write(file_t2.getbuffer())
-                    y2, _ = librosa.load(path2, sr=sr, mono=True)
-                    y2 = y2 / (np.max(np.abs(y2)) + 1e-6) * 0.7 * vol_t2
-                elif use_synth_kick and len(beat_frames) > 0:
+                y = y / (np.max(np.abs(y)) + 1e-6) * 0.7
+
+                timeline_events = []
+                if enable_beats and kick_volume + snare_volume > 0:
+                    mixed = y.copy()
+                    
                     kick_dur = 0.12
-                    t_k = np.linspace(0, kick_dur, int(sr * kick_dur))
-                    freq_sw = np.linspace(140, 45, len(t_k))
-                    kick_wave = np.sin(2 * np.pi * freq_sw * t_k) * np.exp(-8 * t_k) * 0.6 * vol_t2
-                    
-                    y2 = np.zeros(len(master_mix))
-                    adjusted_frames = (beat_frames / tempo_factor).astype(int) - trim_samples
-                    for frame in adjusted_frames:
-                        idx = int(frame)
-                        if 0 <= idx < len(y2) - len(kick_wave):
-                            y2[idx:idx + len(kick_wave)] += kick_wave
+                    t_kick = np.linspace(0, kick_dur, int(sr * kick_dur))
+                    freq_sweep = np.linspace(140, 45, len(t_kick))
+                    kick_wave = np.sin(2 * np.pi * freq_sweep * t_kick) * np.exp(-8 * t_kick) * 0.5 * kick_volume
 
-                if len(y2) > 0:
-                    shift2_samples = int(shift_t2 * sr)
-                    start_idx2 = max(0, shift2_samples)
-                    end_idx2 = start_idx2 + len(y2)
-                    if end_idx2 > len(master_mix):
-                        master_mix = np.pad(master_mix, (0, end_idx2 - len(master_mix)), mode='constant')
-                    master_mix[start_idx2:end_idx2] += y2[:len(master_mix)-start_idx2]
-
-                # Загрузка или генерация Track 3 (Snare / Perc)
-                y3 = np.array([])
-                if file_t3 is not None:
-                    path3 = "temp_t3.mp3"
-                    with open(path3, "wb") as f:
-                        f.write(file_t3.getbuffer())
-                    y3, _ = librosa.load(path3, sr=sr, mono=True)
-                    y3 = y3 / (np.max(np.abs(y3)) + 1e-6) * 0.6 * vol_t3
-                elif use_synth_snare and len(beat_frames) > 0:
                     snare_dur = 0.08
-                    t_s = np.linspace(0, snare_dur, int(sr * snare_dur))
-                    snare_wave = (np.random.normal(0, 1, len(t_s)) * np.exp(-18 * t_s)) * 0.4 * vol_t3
-                    
-                    y3 = np.zeros(len(master_mix))
+                    t_snare = np.linspace(0, snare_dur, int(sr * snare_dur))
+                    snare_wave = (np.random.normal(0, 1, len(t_snare)) * np.exp(-18 * t_snare) + 
+                                  np.sin(2 * np.pi * 220 * t_snare) * np.exp(-12 * t_snare)) * 0.3 * snare_volume
+
                     adjusted_frames = (beat_frames / tempo_factor).astype(int) - trim_samples
+                    
+                    k_shift_samples = int(kick_shift_sec * sr)
+                    s_shift_samples = int(snare_shift_sec * sr)
+
                     for i, frame in enumerate(adjusted_frames):
+                        idx = int(frame)
+                        
+                        k_idx = idx + k_shift_samples
+                        if k_idx >= 0:
+                            timestamp_sec = round(k_idx / sr, 2)
+                            if k_idx + len(kick_wave) < len(mixed):
+                                mixed[k_idx:k_idx + len(kick_wave)] += kick_wave
+                                timeline_events.append({"Время (сек)": timestamp_sec, "Дорожка": "Kick", "Событие": f"Удар #{i+1}"})
+                        
                         if i % 2 == 1:
-                            idx = int(frame)
-                            if 0 <= idx < len(y3) - len(snare_wave):
-                                y3[idx:idx + len(snare_wave)] += snare_wave
+                            s_idx = idx + s_shift_samples
+                            if s_idx >= 0:
+                                timestamp_sec = round(s_idx / sr, 2)
+                                if s_idx + len(snare_wave) < len(mixed):
+                                    mixed[s_idx:s_idx + len(snare_wave)] += snare_wave
+                                    timeline_events.append({"Время (сек)": timestamp_sec, "Дорожка": "Snare", "Событие": f"Акцент #{i+1}"})
 
-                if len(y3) > 0:
-                    shift3_samples = int(shift_t3 * sr)
-                    start_idx3 = max(0, shift3_samples)
-                    end_idx3 = start_idx3 + len(y3)
-                    if end_idx3 > len(master_mix):
-                        master_mix = np.pad(master_mix, (0, end_idx3 - len(master_mix)), mode='constant')
-                    master_mix[start_idx3:end_idx3] += y3[:len(master_mix)-start_idx3]
+                    y = mixed
+                    st.session_state["timeline_events"] = timeline_events
+                else:
+                    st.session_state["timeline_events"] = []
 
-                # --- ЭФФЕКТЫ МАСТЕРА ---
+                if bass_volume > 0:
+                    y_bass = librosa.effects.pitch_shift(y, sr=sr, n_steps=-12)
+                    y_bass = y_bass / (np.max(np.abs(y_bass)) + 1e-6)
+                    
+                    b_shift_samples = int(bass_shift_sec * sr)
+                    if b_shift_samples != 0 and len(y_bass) > abs(b_shift_samples):
+                        if b_shift_samples > 0:
+                            y_bass_shifted = np.pad(y_bass[b_shift_samples:], (b_shift_samples, 0), mode='constant')
+                        else:
+                            abs_s = abs(b_shift_samples)
+                            y_bass_shifted = np.pad(y_bass, (0, abs_s), mode='constant')[abs_s:]
+                        y_bass = y_bass_shifted[:len(y)]
+
+                    y = y + (y_bass * bass_volume * 0.3)
+
                 if reverb_mix > 0:
-                    delay_samples = int(sr * 0.15)
-                    rev_sig = np.zeros_like(master_mix)
-                    if len(master_mix) > delay_samples:
-                        rev_sig[delay_samples:] = master_mix[:-delay_samples] * reverb_mix
-                        master_mix = master_mix + rev_sig
+                    delay_samples = int(sr * (reverb_delay_ms / 1000.0))
+                    reverb_signal = np.zeros_like(y)
+                    if len(y) > delay_samples:
+                        reverb_signal[delay_samples:] = y[:-delay_samples] * reverb_mix
+                        y = y + reverb_signal
 
                 if vinyl_noise > 0:
-                    master_mix = master_mix + np.random.normal(0, vinyl_noise, len(master_mix))
+                    y = y + np.random.normal(0, vinyl_noise, len(y))
 
-                # Мастеринг лимитер
-                master_mix = np.tanh(master_mix * 1.15) / 1.15
-                max_v = np.max(np.abs(master_mix))
-                if max_v > 0:
-                    master_mix = master_mix / max_v * 0.92
-
-                output_path = "session_master.wav"
-                sf.write(output_path, master_mix, sr, subtype='PCM_16')
-                st.session_state["ready_audio"] = output_path
+                y = np.tanh(y * 1.15) / 1.15
+                max_val = np.max(np.abs(y))
+                if max_val > 0:
+                    y = y / max_val * 0.92
+                
+                safe_audio_path = "remixed_track.wav"
+                sf.write(safe_audio_path, y, sr, subtype='PCM_16')
+                st.session_state["ready_audio"] = safe_audio_path
                 st.session_state["detected_bpm"] = round(effective_bpm, 1)
 
-                # --- ОТРИСОВКА ВИЗУАЛЬНЫХ ДОРОЖЕК WAVELINES (КАК В ADOBE AUDITION) ---
-                fig, axes = plt.subplots(3, 1, figsize=(10, 6), facecolor="#1e1e1e")
-                for ax in axes:
-                    ax.set_facecolor("#121212")
-                    ax.tick_params(colors='white')
-                    ax.xaxis.label.set_color('white')
-                    ax.yaxis.label.set_color('white')
-
-                # Track 1 plot
-                t_axis1 = np.linspace(0, len(y1)/sr, len(y1)) + shift_t1
-                axes[0].plot(t_axis1, y1, color="#00ffcc", linewidth=0.8)
-                axes[0].set_title("Track 1: Main Audio Session", color="white", fontsize=10)
-                axes[0].grid(True, color="#333333", linestyle="--")
-
-                # Track 2 plot
-                if len(y2) > 0:
-                    t_axis2 = np.linspace(0, len(y2)/sr, len(y2)) + shift_t2
-                    axes[1].plot(t_axis2, y2, color="#ff5555", linewidth=0.8)
-                axes[1].set_title("Track 2: Kick / Bass Lane", color="white", fontsize=10)
-                axes[1].grid(True, color="#333333", linestyle="--")
-
-                # Track 3 plot
-                if len(y3) > 0:
-                    t_axis3 = np.linspace(0, len(y3)/sr, len(y3)) + shift_t3
-                    axes[2].plot(t_axis3, y3, color="#aa55ff", linewidth=0.8)
-                axes[2].set_title("Track 3: Snare / Percussion Lane", color="white", fontsize=10)
-                axes[2].grid(True, color="#333333", linestyle="--")
-
-                plt.tight_layout()
-                waveform_filename = "session_waveforms.png"
-                plt.savefig(waveform_filename, dpi=150, facecolor=fig.get_facecolor(), edgecolor='none')
-                plt.close(fig)
-                st.session_state["ready_waveforms"] = waveform_filename
-
             except Exception as e:
-                st.error(f"Ошибка сведения сессии: {e}")
+                st.error(f"Ошибка при обработке аудио: {e}")
                 st.stop()
-
+        
         # --- ГЕНЕРАЦИЯ ОБЛОЖКИ ---
-        with st.spinner("🎨 Создаем обложку релиза..."):
+        with st.spinner("🎨 Создаем премиальную обложку NBS SOFT..."):
+            bg_image = None
             try:
-                bg_img = Image.open(BytesIO(requests.get(f"https://picsum.photos/id/{random.choice([1047,1058,1078,1062])}/1280/720").content)).convert("RGB")
-                bg_img = bg_img.filter(ImageFilter.GaussianBlur(radius=3))
+                random_photo_id = random.choice([1047, 1058, 1078, 1062, 1039])
+                image_url = f"https://picsum.photos/id/{random_photo_id}/1280/720"
+                response = requests.get(image_url, timeout=10)
+                if response.status_code == 200:
+                    bg_image = Image.open(BytesIO(response.content)).convert("RGB")
+                    bg_image = bg_image.filter(ImageFilter.GaussianBlur(radius=3))
             except:
-                bg_img = Image.new("RGB", (1280, 720), (20, 20, 30))
+                bg_image = None
 
-            cover = Image.alpha_composite(bg_img.convert("RGBA"), Image.new("RGBA", bg_img.size, (0, 0, 0, 185)))
-            draw = ImageDraw.Draw(cover)
+            if bg_image is None:
+                bg_image = Image.new("RGB", (1280, 720), (20, 20, 30))
+
+            darken = Image.new("RGBA", bg_image.size, (0, 0, 0, 185))
+            cover_image = Image.alpha_composite(bg_image.convert("RGBA"), darken)
+            draw = ImageDraw.Draw(cover_image)
+
             font_path = "C:\\Windows\\Fonts\\arialbd.ttf"
-            t_font = ImageFont.truetype(font_path, 85) if os.path.exists(font_path) else ImageFont.load_default()
-            s_font = ImageFont.truetype(font_path, 42) if os.path.exists(font_path) else ImageFont.load_default()
+            title_font = ImageFont.truetype(font_path, 85) if os.path.exists(font_path) else ImageFont.load_default()
+            sub_font = ImageFont.truetype(font_path, 42) if os.path.exists(font_path) else ImageFont.load_default()
 
-            draw.text((90, 180), song_title.upper(), font=t_font, fill=(255,255,255,255))
-            draw.text((90, 300), f"⚡ {genre_category} | NBS SOFT DAW", font=s_font, fill=(255,215,0,255))
+            for ax in range(-4, 5):
+                for ay in range(-4, 5):
+                    draw.text((90 + ax, 180 + ay), song_title.upper(), font=title_font, fill=(0,0,0,255))
             
-            cov_path = "youtube_cover.png"
-            cover.convert("RGB").save(cov_path, "PNG")
-            st.session_state["ready_cover"] = cov_path
+            draw.text((90, 180), song_title.upper(), font=title_font, fill=(255,255,255,255))
+            draw.text((90, 300), f"⚡ {genre_text.upper()} | NBS SOFT", font=sub_font, fill=(255,215,0,255))
 
-        st.success("🎉 Многодорожечная сессия успешно сведена!")
+            cover_filename = "youtube_cover.png"
+            cover_image.convert("RGB").save(cover_filename, "PNG")
+            st.session_state["ready_cover"] = cover_filename
 
-# --- ВЫВОД РЕЗУЛЬТАТОВ И ВИЗУАЛИЗАЦИИ СЕССИИ ---
-if "ready_waveforms" in st.session_state and os.path.exists(st.session_state["ready_waveforms"]):
-    st.markdown("---")
-    st.subheader("🖥️ Визуализация сессии таймлайна (Waveform Tracks):")
-    st.image(st.session_state["ready_waveforms"], caption="Многодорожечные аудиоволны сессии", use_container_width=True)
+        st.success(f"🎉 Проект успешно сведен! Новый BPM: **{st.session_state.get('detected_bpm', 120)}**.")
 
-if "ready_audio" in st.session_state and os.path.exists(st.session_state["ready_audio"]):
-    st.markdown("---")
-    st.subheader(f"🎵 Мастер-микс сессии (BPM: {st.session_state.get('detected_bpm', 'Auto')}):")
-    st.audio(st.session_state["ready_audio"], format="audio/wav")
-    
-    with open(st.session_state["ready_audio"], "rb") as af:
-        st.download_button("📥 Скачать Master WAV", af, file_name="session_master.wav", mime="audio/wav")
+    # --- ОТОБРАЖЕНИЕ РЕЗУЛЬТАТОВ И ТАЙМЛАЙНА ---
+    if "ready_cover" in st.session_state and os.path.exists(st.session_state["ready_cover"]):
+        st.markdown("---")
+        st.subheader("📥 Готовые материалы релиза:")
+        st.image(st.session_state["ready_cover"], caption="Обложка релиза (1280x720)", use_container_width=True)
+        
+        with open(st.session_state["ready_cover"], "rb") as img_file:
+            st.download_button("📥 Скачать обложку (PNG)", img_file, file_name="youtube_cover.png", mime="image/png")
 
-if "ready_cover" in st.session_state and os.path.exists(st.session_state["ready_cover"]):
-    st.markdown("---")
-    st.subheader("📥 Обложка релиза:")
-    st.image(st.session_state["ready_cover"], use_container_width=True)
-    with open(st.session_state["ready_cover"], "rb") as cf:
-        st.download_button("📥 Скачать обложку PNG", cf, file_name="youtube_cover.png", mime="image/png")
+    if "ready_audio" in st.session_state and os.path.exists(st.session_state["ready_audio"]):
+        st.markdown(f"🎵 **Прослушать готовый многодорожечный трек (BPM: {st.session_state.get('detected_bpm', 'Auto')}):**")
+        st.audio(st.session_state["ready_audio"], format="audio/wav")
+        
+        with open(st.session_state["ready_audio"], "rb") as aud_file:
+            st.download_button("📥 Скачать трек в HQ (WAV)", aud_file, file_name="remixed_track.wav", mime="audio/wav")
 
-# --- YOUTUBE SEO ---
-st.markdown("---")
-st.subheader("🚀 YouTube SEO Оптимизация")
-yt_title = f"{song_title} [{genre_category} / Multi-Track DAW Mix] | NBS SOFT"
-st.code(yt_title, language="text")
-yt_desc = f"""Artist: {artist_name}
-Track: {song_title}
-Session Mix produced via NBS SOFT Multi-Track DAW Studio.
+        # --- ТАЙМЛАЙН РЕДАКТОР ---
+        if "timeline_events" in st.session_state and st.session_state["timeline_events"]:
+            st.markdown("---")
+            st.subheader("🎚️ Таймлайн-редактор: Сводка дорожек")
+            st.write("Точные позиции сэмплов с учетом примененных смещений:")
+            
+            df_timeline = pd.DataFrame(st.session_state["timeline_events"])
+            st.dataframe(df_timeline, use_container_width=True)
 
-#️⃣ Tags: #{song_title.replace(' ','')} #{genre_category.split()[0]} #AudioSession #NBSSoft #Remix #StudioMaster
-"""
-st.text_area("Описание для видео:", yt_desc, height=120)
+        # --- YOUTUBE SEO ---
+        st.markdown("---")
+        st.subheader("🚀 YouTube SEO Оптимизация (Названия, Описание, Теги)")
+        
+        clean_title_slug = song_title.replace(" ", "")
+        genre_slug = default_genre_text.split(" ")[0]
+
+        yt_titles = [
+            f"{song_title} [{default_genre_text} / HQ Audio] | NBS SOFT",
+            f"{artist_name} - {song_title} (Slowed & Reverb / Bass Boosted)",
+            f"{song_title} — {default_genre_text} (Vibe Edition)"
+        ]
+        
+        st.markdown("**💡 1. Оптимизированные названия:**")
+        for t in yt_titles:
+            st.code(t, language="text")
+
+        yt_description = f"""🎵 Artist: {artist_name}
+🎧 Track: {song_title}
+✨ Version: {default_genre_text}
+⚡ Powered by NBS SOFT Studio
+
+Immerse yourself in the ultimate atmosphere. Enjoy the vibe, drop a like, and subscribe
