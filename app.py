@@ -1,7 +1,6 @@
 import streamlit as st
 import os
 import random
-import time
 import requests
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -139,58 +138,64 @@ if uploaded_file is not None:
     genre_text = st.text_input("Текст жанра на обложке", default_genre_text)
 
     # --- ПАНЕЛЬ НАСТРОЙКИ КАЧЕСТВА И УДАРНЫХ ---
-    st.subheader("🎛️ Студийный FX Rack & Таймлайн ударных")
+    st.subheader("🎛️ Студийный FX Rack & Настройка дорожек")
     
     col_fx1, col_fx2 = st.columns(2)
     with col_fx1:
         pitch_shift = st.slider("🔑 Сдвиг тональности (полутоны)", -5.0, 3.0, -2.0, 0.5)
         tempo_factor = st.slider("⏱ Скорость (Темп)", 0.70, 1.20, 0.82, 0.01)
-        bass_boost_gain = st.slider("🔊 Усиление баса (Bass Boost)", 0.0, 3.0, 1.2, 0.1)
+        trim_start_sec = st.slider("✂️ Обрезать начало трека (сек) [Удаление артефактов старта]", 0.0, 1.0, 0.15, 0.05)
     with col_fx2:
         reverb_mix = st.slider("🌊 Интенсивность эха / Реверберации", 0.0, 1.0, 0.40, 0.05)
         reverb_delay_ms = st.slider("⏳ Задержка эха (Delay, мс)", 80, 300, 150, 10)
         vinyl_noise = st.slider("📻 Плотность винилового шума", 0.0, 0.015, 0.002, 0.001)
 
+    st.markdown("---")
+    st.subheader("🥁 Настройка слоев ударных и баса (Timeline Beats)")
+    
+    col_beat1, col_beat2, col_beat3 = st.columns(3)
+    with col_beat1:
+        kick_volume = st.slider("🔊 Громкость Kick (Бочка)", 0.0, 2.0, 1.0, 0.1)
+    with col_beat2:
+        snare_volume = st.slider("🔊 Громкость Snare (Снейр)", 0.0, 2.0, 0.8, 0.1)
+    with col_beat3:
+        bass_volume = st.slider("🔊 Громкость 808 Bass (Саб)", 0.0, 2.0, 1.2, 0.1)
+
     selected_beat_layer = st.selectbox(
-        "🎶 Дополнительные ударные и бас-биты",
+        "🎶 Ритмический паттерн ударных",
         [
-            "Нет (Чистая обработка исходника)",
-            "Drift Phonk Heavy Kick (Мощные ударные и саб-бас)",
-            "Lo-Fi Chill Percussion (Мягкие винтажные удары)",
-            "Cyberpunk Electronic Beat (Плотный электронный ритм)"
+            "Drift Phonk Heavy Kick & Snare (Мощный кач)",
+            "Lo-Fi Chill Percussion (Мягкий ритм)",
+            "Cyberpunk Electronic Beat (Плотный электронный бит)",
+            "Нет (Чистая обработка без добавления ударных)"
         ]
     )
 
-    if st.button("🚀 Обработать трек и изменить звучание"):
+    if st.button("🚀 Обработать трек и применить мастеринг"):
         
-        # --- ОБРАБОТКА АУДИО БЕЗ СПЕКТРАЛЬНЫХ АРТЕФАКТОВ («ТЫЫЫЗ») ---
-        with st.spinner("🔄 Устраняем артефакты фазового вокодера, пересобираем звук и мастеринг..."):
+        # --- ОБРАБОТКА АУДИО И СБОРКА ТАЙМЛАЙНА ---
+        with st.spinner("🔄 Чистка спектра, сведение дорожек и мастеринг..."):
             try:
                 # Загружаем трек
                 y, sr = librosa.load(audio_path, sr=None, mono=True)
                 
-                # 1. Анализ BPM на исходнике до любых сдвигов
+                # Анализ BPM
                 tempo_detected, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
                 if isinstance(tempo_detected, np.ndarray):
                     track_bpm = float(tempo_detected[0])
                 else:
                     track_bpm = float(tempo_detected)
                 
-                # --- ЗАЩИТА ОТ АРТЕФАКТОВ ПИТЧА И ТЕМПА («ТЫЫЫЗ») ---
-                # Добавляем 1 секунду тишины в начале и в конце перед питч-шифтом и стрейчем,
-                # чтобы спектральный алгоритм librosa «разгонялся» на тишине, а не на срезе аудио.
+                # Защита от артефактов через паддинг
                 pad_len = int(sr * 1.0)
                 y_padded = np.pad(y, (pad_len, pad_len), mode='constant')
 
-                # 2. Изменение тональности (Питч) на защищенном буфере
                 if pitch_shift != 0.0:
                     y_padded = librosa.effects.pitch_shift(y_padded, sr=sr, n_steps=pitch_shift, n_fft=2048, hop_length=512)
                 
-                # 3. Изменение скорости (Темп)
                 if tempo_factor != 1.0:
                     y_padded = librosa.effects.time_stretch(y_padded, rate=tempo_factor)
                 
-                # Отрезаем добавленный буфер обратно вместе со всеми возможными артефактами старта
                 effective_pad = int(pad_len * (1.0 / tempo_factor))
                 if len(y_padded) > 2 * effective_pad:
                     y = y_padded[effective_pad : -effective_pad]
@@ -199,59 +204,67 @@ if uploaded_file is not None:
 
                 effective_bpm = track_bpm * tempo_factor
 
-                # Дополнительная зачистка самого первого микро-отрезка (50мс) чистой тишиной с плавным входом
-                if len(y) > int(sr * 0.05):
-                    y[:int(sr * 0.05)] = 0.0
+                # Отрезаем указанное пользователем время от начала для полного удаления «тыыыз»
+                trim_samples = int(trim_start_sec * sr)
+                if len(y) > trim_samples:
+                    y = y[trim_samples:]
 
-                # Нормализуем исходник перед добавлением эффектов
+                # Абсолютно плавный Fade-In на старте (50мс)
+                fade_samples = int(sr * 0.05)
+                if len(y) > fade_samples:
+                    y[:fade_samples] = y[:fade_samples] * np.linspace(0.0, 1.0, fade_samples)
+
                 y = y / (np.max(np.abs(y)) + 1e-6) * 0.7
 
-                # 4. Добавление мощных ударных по сетке BPM
+                # --- ДОБАВЛЕНИЕ УДАРНЫХ И БАСА ПО ТАЙМЛАЙНУ ---
                 timeline_events = []
                 if selected_beat_layer != "Нет":
                     mixed = y.copy()
                     
-                    kick_dur = 0.15
+                    # Генерация чистой бочки (Kick) без кликов
+                    kick_dur = 0.12
                     t_kick = np.linspace(0, kick_dur, int(sr * kick_dur))
-                    freq_sweep = np.linspace(150, 40, len(t_kick))
-                    kick_wave = np.sin(2 * np.pi * freq_sweep * t_kick) * np.exp(-6 * t_kick) * 0.45
+                    freq_sweep = np.linspace(140, 45, len(t_kick))
+                    kick_wave = np.sin(2 * np.pi * freq_sweep * t_kick) * np.exp(-8 * t_kick) * 0.5 * kick_volume
 
-                    snare_dur = 0.09
+                    # Генерация снейра (Snare)
+                    snare_dur = 0.08
                     t_snare = np.linspace(0, snare_dur, int(sr * snare_dur))
-                    snare_wave = np.random.normal(0, 1, len(t_snare)) * np.exp(-14 * t_snare) * 0.25
+                    snare_wave = (np.random.normal(0, 1, len(t_snare)) * np.exp(-18 * t_snare) + 
+                                  np.sin(2 * np.pi * 220 * t_snare) * np.exp(-12 * t_snare)) * 0.3 * snare_volume
 
-                    adjusted_frames = (beat_frames / tempo_factor).astype(int)
+                    adjusted_frames = (beat_frames / tempo_factor).astype(int) - trim_samples
 
                     for i, frame in enumerate(adjusted_frames):
                         idx = int(frame)
-                        
-                        # Не позволяем ударным бить раньше 0.4 секунд
-                        if idx < int(sr * 0.4):
+                        if idx < int(sr * 0.1):
                             continue
                             
-                        timestamp_sec = round(idx / sr, 2)
+                        timestamp_sec = round(max(0, idx) / sr, 2)
                         
+                        # Внедрение бочки
                         if idx + len(kick_wave) < len(mixed):
                             mixed[idx:idx + len(kick_wave)] += kick_wave
-                            timeline_events.append({"Время (сек)": timestamp_sec, "Тип звука": "Kick (Бочка)", "Доля": i + 1})
+                            timeline_events.append({"Время (сек)": timestamp_sec, "Тип дорожки": "Kick (Бочка)", "Событие": f"Удар #{i+1}"})
                         
+                        # Внедрение снейра на каждый нечетный такт
                         if i % 2 == 1:
                             if idx + len(snare_wave) < len(mixed):
                                 mixed[idx:idx + len(snare_wave)] += snare_wave
-                                timeline_events.append({"Время (сек)": timestamp_sec, "Тип звука": "Snare / Percussion", "Доля": i + 1})
+                                timeline_events.append({"Время (сек)": timestamp_sec, "Тип дорожки": "Snare (Снейр)", "Событие": f"Акцент #{i+1}"})
 
                     y = mixed
                     st.session_state["timeline_events"] = timeline_events
                 else:
                     st.session_state["timeline_events"] = []
 
-                # 5. Усиление баса
-                if bass_boost_gain > 0:
+                # --- 808 SUB-BASS ---
+                if bass_volume > 0:
                     y_bass = librosa.effects.pitch_shift(y, sr=sr, n_steps=-12)
                     y_bass = y_bass / (np.max(np.abs(y_bass)) + 1e-6)
-                    y = y + (y_bass * bass_boost_gain * 0.25)
+                    y = y + (y_bass * bass_volume * 0.3)
 
-                # 6. Эхо и реверберация
+                # --- ЭХО И РЕВЕРБЕРАЦИЯ ---
                 if reverb_mix > 0:
                     delay_samples = int(sr * (reverb_delay_ms / 1000.0))
                     reverb_signal = np.zeros_like(y)
@@ -259,20 +272,12 @@ if uploaded_file is not None:
                         reverb_signal[delay_samples:] = y[:-delay_samples] * reverb_mix
                         y = y + reverb_signal
 
-                # 7. Шум винила
+                # --- ВИНИЛОВЫЙ ШУМ ---
                 if vinyl_noise > 0:
-                    noise = np.random.normal(0, vinyl_noise, len(y))
-                    y = y + noise
+                    y = y + np.random.normal(0, vinyl_noise, len(y))
 
-                # --- АБСОЛЮТНО ЧИСТЫЙ СТАРТ: Плавный Fade-In (100 мс) ---
-                fade_samples = int(sr * 0.1)
-                if len(y) > fade_samples:
-                    fade_curve = np.linspace(0.0, 1.0, fade_samples)
-                    y[:fade_samples] = y[:fade_samples] * fade_curve
-
-                # --- ПРОФЕССИОНАЛЬНЫЙ МАСТЕРИНГ И МЯГКИЙ ЛИМИТЕР ---
+                # --- МАСТЕРИНГ И ЛИМИТЕР ---
                 y = np.tanh(y * 1.15) / 1.15
-
                 max_val = np.max(np.abs(y))
                 if max_val > 0:
                     y = y / max_val * 0.92
@@ -321,7 +326,7 @@ if uploaded_file is not None:
             cover_image.convert("RGB").save(cover_filename, "PNG")
             st.session_state["ready_cover"] = cover_filename
 
-        st.success(f"🎉 Готово! Измененный BPM: **{st.session_state.get('detected_bpm', 120)}**. Артефакты («тыыыз») полностью устранены!")
+        st.success(f"🎉 Готово! Новый BPM: **{st.session_state.get('detected_bpm', 120)}**. Артефакты отрезаны, дорожки сведены!")
 
     # --- ОТОБРАЖЕНИЕ РЕЗУЛЬТАТОВ И ТАЙМЛАЙНА ---
     if "ready_cover" in st.session_state and os.path.exists(st.session_state["ready_cover"]):
@@ -342,8 +347,8 @@ if uploaded_file is not None:
         # --- ТАЙМЛАЙН РЕДАКТОР ---
         if "timeline_events" in st.session_state and st.session_state["timeline_events"]:
             st.markdown("---")
-            st.subheader("🎚️ Таймлайн-редактор: Моменты добавления ударных")
-            st.write("Ниже показана точная сетка времени (в секундах), куда были внедрены удары бочки и перкуссии:")
+            st.subheader("🎚️ Таймлайн-редактор: Дорожки ударных и баса")
+            st.write("Синхронизированная таблица точек внедрения сэмплов по сетке трека:")
             
             df_timeline = pd.DataFrame(st.session_state["timeline_events"])
             st.dataframe(df_timeline, use_container_width=True)
