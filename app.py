@@ -51,6 +51,24 @@ def verify_user(username, password):
         return True
     return False
 
+# Функция для кроссплатформенной загрузки шрифта
+def get_font(size):
+    # Возможные пути к шрифтам на Linux (Streamlit Cloud) и Windows
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/Arial.ttf",
+        "C:\\Windows\\Fonts\\arialbd.ttf",
+        "C:\\Windows\\Fonts\\Arial.ttf"
+    ]
+    for path in font_paths:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except:
+                continue
+    return ImageFont.load_default()
+
 # Настройка страницы
 st.set_page_config(page_title="NBS SOFT — Pro Multi-Track DAW", page_icon="👑", layout="centered")
 
@@ -144,7 +162,7 @@ if uploaded_file is not None:
     with col_fx1:
         pitch_shift = st.slider("🔑 Сдвиг тональности (полутоны)", -5.0, 3.0, -2.0, 0.5)
         tempo_factor = st.slider("⏱ Скорость (Темп)", 0.70, 1.20, 0.82, 0.01)
-        trim_start_sec = st.slider("✂️️ Обрезка старта трека (сек)", 0.0, 1.0, 0.15, 0.05)
+        trim_start_sec = st.slider("✂ Обрезка старта трека (сек)", 0.0, 1.0, 0.15, 0.05)
     with col_fx2:
         reverb_mix = st.slider("🌊 Реверберация (Эхо)", 0.0, 1.0, 0.40, 0.05)
         reverb_delay_ms = st.slider("⏳ Задержка эха (Delay, мс)", 80, 300, 150, 10)
@@ -317,9 +335,8 @@ if uploaded_file is not None:
             cover_image = Image.alpha_composite(bg_image.convert("RGBA"), darken)
             draw = ImageDraw.Draw(cover_image)
 
-            font_path = "C:\\Windows\\Fonts\\arialbd.ttf"
-            title_font = ImageFont.truetype(font_path, 85) if os.path.exists(font_path) else ImageFont.load_default()
-            sub_font = ImageFont.truetype(font_path, 42) if os.path.exists(font_path) else ImageFont.load_default()
+            title_font = get_font(85)
+            sub_font = get_font(42)
 
             for ax in range(-4, 5):
                 for ay in range(-4, 5):
@@ -381,4 +398,19 @@ if uploaded_file is not None:
 ✨ Version: {default_genre_text}
 ⚡ Powered by NBS SOFT Studio
 
-Immerse yourself in the ultimate atmosphere. Enjoy the vibe, drop a like, and subscribe
+Immerse yourself in the ultimate atmosphere. Enjoy the vibe, drop a like, and subscribe for more daily releases!
+
+📌 Support & Links:
+• Telegram Channel: Link in Bio
+• Stream / Download: Available on all platforms
+
+#️⃣ Tags & Hashtags:
+#{clean_title_slug} #{genre_slug} #SlowedAndReverb #Phonk #BassBoosted #MusicVibes #Audio #NBSSoft #TrendingMusic
+"""
+        st.markdown("**📝 2. Полное SEO-описание для видео:**")
+        st.text_area("Скопируйте описание:", yt_description, height=160)
+
+        youtube_tags = f"{song_title}, {artist_name}, {song_title} slowed, {song_title} reverb, {default_genre_text}, phonk, bass boosted, chill music, aesthetic music, slowed and reverb songs, nbs soft, audio edit, remix, tiktok music, youtube shorts music, 8d audio, nightcore"
+        
+        st.markdown("**🏷️️ 3. Теги для YouTube Studio:**")
+        st.code(youtube_tags, language="text")
