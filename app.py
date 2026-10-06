@@ -52,7 +52,7 @@ def verify_user(username, password):
     return False
 
 # Настройка страницы
-st.set_page_config(page_title="NBS SOFT — AI Music & Viral Studio", page_icon="👑", layout="centered")
+st.set_page_config(page_title="NBS SOFT — AI Music & FX Studio", page_icon="👑", layout="centered")
 
 # Сессия для авторизации
 if "logged_in" not in st.session_state:
@@ -63,7 +63,7 @@ if "username" not in st.session_state:
 # --- ЭКРАН АВТОРИЗАЦИИ / РЕГИСТРАЦИИ ---
 if not st.session_state["logged_in"]:
     st.title("🔐 NBS SOFT — Вход в платформу")
-    st.write("Войдите в систему, чтобы получить доступ к генератору треков, студии ремиксов и автогенератору вирусных Shorts/TikTok роликов.")
+    st.write("Войдите в систему для доступа к студии эффектов, микшеру и вирусным роликам.")
     
     tab1, tab2 = st.tabs(["🔑 Вход", "📝 Регистрация"])
     
@@ -94,7 +94,8 @@ if not st.session_state["logged_in"]:
     st.stop()
 
 # --- БОКОВАЯ ПАНЕЛЬ С БРЕНДИНГОМ NBS SOFT ---
-st.sidebar.image("logo_cropped.png", use_container_width=True)
+if os.path.exists("logo_cropped.png"):
+    st.sidebar.image("logo_cropped.png", use_container_width=True)
 st.sidebar.markdown("---")
 st.sidebar.write(f"👤 Аккаунт: **{st.session_state['username']}**")
 if st.sidebar.button("🚪 Выйти из аккаунта"):
@@ -103,8 +104,8 @@ if st.sidebar.button("🚪 Выйти из аккаунта"):
     st.rerun()
 
 # --- ОСНОВНОЙ ФУНКЦИОНАЛ ПРИЛОЖЕНИЯ ---
-st.title("👑 NBS SOFT — AI Music & Viral Studio")
-st.write("Профессиональная студия ремиксов, защиты от Content ID и автогенерации контента для YouTube и TikTok!")
+st.title("👑 NBS SOFT — Профессиональная студия эффектов")
+st.write("Тонкая настройка реверберации, эха, басов, винила и микширования битов!")
 
 # Загрузка трека
 uploaded_file = st.file_uploader("Загрузите исходный трек (.mp3 или .wav)", type=["mp3", "wav"])
@@ -114,26 +115,19 @@ if uploaded_file is not None:
     with open(audio_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
     
-    st.success("Файл успешно загружен!")
+    st.success("Трек успешно загружен в студию!")
     
-    # Режим работы
-    mode = st.radio(
-        "🎯 Выберите режим работы:",
-        ["🎚️ Профессиональный Ремикс & Защита", "🎬 Генератор вирусных Shorts / TikTok сценариев"]
-    )
-    
-    # Настройки стиля и обложки
-    st.subheader("🎨 Настройки релиза и визуального контента")
+    # Настройки стиля и релиза
+    st.subheader("🎨 Настройки релиза и обложки")
     
     genre_category = st.selectbox(
-        "🎵 Музыкальная ниша / Стиль",
+        "🎵 Музыкальный стиль",
         [
-            "LO-FI / CHILL MUSIC (Мягкий расслабленный вайб)",
-            "SLOWED & REVERB (Глубокий атмосферный замедленный вайб)",
-            "PHONK / DRIFT PHONK (Глубокий бас, темный кач)",
-            "NIGHTCORE / FAST VIBE (Энергичный высокий темп)",
-            "DEEP HOUSE / CLUB (Клубный ритм)",
-            "SYNTHWAVE / RETRO 80s (Космический ретро-вайб)"
+            "SLOWED & REVERB (Глубокий атмосферный вайб)",
+            "PHONK / DRIFT PHONK (Качающий бас и темный звук)",
+            "LO-FI / CHILL BEATS (Мягкий винтажный звук)",
+            "NIGHTCORE / HIGH SPEED (Энергичный ускоренный вайб)",
+            "SYNTHWAVE / RETRO 80s (Космическая атмосфера)"
         ]
     )
     
@@ -143,38 +137,79 @@ if uploaded_file is not None:
     default_genre_text = genre_category.split(" (")[0]
     genre_text = st.text_input("Текст жанра на обложке", default_genre_text)
 
-    # Аудио параметры
-    pitch_shift, tempo_factor, add_reverb, add_vinyl = -1.0, 0.90, True, True
+    # --- ПАНЕЛЬ ТОЧНОЙ НАСТРОЙКИ ЭФФЕКТОВ (FX RACK) ---
+    st.subheader("🎛️ Мастер эффектов и обработки звука (FX Rack)")
+    
+    col_fx1, col_fx2 = st.columns(2)
+    with col_fx1:
+        pitch_shift = st.slider("🔑 Сдвиг тональности (полутоны)", -5.0, 3.0, -1.5, 0.5)
+        tempo_factor = st.slider("⏱️ Скорость (Темп)", 0.70, 1.20, 0.85, 0.01)
+        bass_boost_gain = st.slider("🔊 Усиление баса (Bass Boost)", 0.0, 2.0, 0.6, 0.1)
+    with col_fx2:
+        reverb_mix = st.slider("🌊 Интенсивность эха / Реверберации", 0.0, 1.0, 0.45, 0.05)
+        reverb_delay_ms = st.slider("⏳ Задержка эха (Delay, мс)", 50, 300, 120, 10)
+        vinyl_noise = st.slider("📻 Плотность шума винила", 0.0, 0.02, 0.004, 0.001)
 
-    if "Ремикс" in mode or "SLOWED" in genre_category:
-        with st.expander("🎛️ Настройки студийных эффектов ремикса"):
-            pitch_shift = st.slider("Сдвиг тональности", -4.0, 2.0, -2.0, 0.5)
-            tempo_factor = st.slider("Скорость (Темп)", 0.75, 0.95, 0.82, 0.01)
-            add_reverb = st.checkbox("Эффект эха (Reverb)", value=True)
-            add_vinyl = st.checkbox("Шум винила (Vinyl Crackle)", value=True)
+    # Выбор дополнительного фонового бита
+    selected_beat_layer = st.selectbox(
+        "🎶 Дополнительный фоновый ритм / бит",
+        [
+            "Нет",
+            "Drift Phonk Drum Loop (Качающие ударные)",
+            "Lo-Fi Rain & Vinyl Atmosphere (Дождь и винил)",
+            "Cyberpunk Bass Pulse (Плотный басовый пульс)",
+            "Chill Ambient Pad (Космический синтезатор)"
+        ]
+    )
 
-    if st.button("🚀 Запустить генерацию контента и SEO"):
+    if st.button("🚀 Обработать трек и создать обложку"):
         
-        # --- ОБРАБОТКА АУДИО ---
-        with st.spinner("🔄 Обрабатываем аудио и защищаем от Content ID..."):
+        # --- ОБРАБОТКА АУДИО С УЧЕТОМ ТОЧНЫХ НАСТРОЕК ---
+        with st.spinner("🔄 Применяем студийные эффекты и микшируем аудио..."):
             try:
                 y, sr = librosa.load(audio_path, sr=None, res_type='kaiser_best')
+                
+                # Тон и темп
                 if pitch_shift != 0.0:
                     y = librosa.effects.pitch_shift(y, sr=sr, n_steps=pitch_shift, n_fft=2048, hop_length=512)
                 if tempo_factor != 1.0:
                     y = librosa.effects.time_stretch(y, rate=tempo_factor)
                 
-                if add_reverb:
-                    delay_samples = int(sr * 0.08)
+                # Точный Bass Boost
+                if bass_boost_gain > 0:
+                    y_bass = librosa.effects.pitch_shift(y, sr=sr, n_steps=-12)
+                    y = y + (y_bass * bass_boost_gain)
+
+                # Точное Эхо / Реверберация (Reverb & Delay)
+                if reverb_mix > 0:
+                    delay_samples = int(sr * (reverb_delay_ms / 1000.0))
                     reverb_signal = np.zeros_like(y)
                     if len(y) > delay_samples:
-                        reverb_signal[delay_samples:] = y[:-delay_samples] * 0.35
+                        reverb_signal[delay_samples:] = y[:-delay_samples] * reverb_mix
                         y = y + reverb_signal
 
-                if add_vinyl:
-                    noise = np.random.normal(0, 0.004, len(y))
+                # Шум винила
+                if vinyl_noise > 0:
+                    noise = np.random.normal(0, vinyl_noise, len(y))
                     y = y + noise
 
+                # Добавление фонового бита / атмосферы
+                if selected_beat_layer != "Нет":
+                    t = np.linspace(0, len(y)/sr, len(y))
+                    if "Phonk" in selected_beat_layer:
+                        beat_pulse = np.sin(2 * np.pi * 2.2 * t) * 0.18
+                        y = y + (beat_pulse * y)
+                    elif "Rain" in selected_beat_layer:
+                        rain_noise = np.random.normal(0, 0.01, len(y))
+                        y = y + rain_noise
+                    elif "Cyberpunk" in selected_beat_layer:
+                        synth_pulse = np.sin(2 * np.pi * 1.5 * t) * 0.15
+                        y = y + synth_pulse
+                    elif "Ambient" in selected_beat_layer:
+                        pad_pulse = np.sin(2 * np.pi * 0.8 * t) * 0.12
+                        y = y + pad_pulse
+
+                # Нормализация громкости
                 max_val = max(abs(y.min()), abs(y.max()))
                 if max_val > 0:
                     y = y / max_val * 0.95
@@ -185,8 +220,8 @@ if uploaded_file is not None:
                 st.error(f"Ошибка при обработке аудио: {e}")
                 st.stop()
         
-        # --- ГЕНЕРАЦИЯ ОБЛОЖКИ (КРУПНЫЙ И ЧЕТКИЙ ТЕКСТ) ---
-        with st.spinner("🎨 Создаем крупную обложку 1280x720..."):
+        # --- ГЕНЕРАЦИЯ ОБЛОЖКИ ---
+        with st.spinner("🎨 Создаем премиальную обложку NBS SOFT..."):
             bg_image = None
             try:
                 random_photo_id = random.choice([1047, 1058, 1078, 1062, 1039])
@@ -206,11 +241,9 @@ if uploaded_file is not None:
             draw = ImageDraw.Draw(cover_image)
 
             font_path = "C:\\Windows\\Fonts\\arialbd.ttf"
-            # Увеличенные размеры шрифтов для отличной читаемости
             title_font = ImageFont.truetype(font_path, 85) if os.path.exists(font_path) else ImageFont.load_default()
-            sub_font = ImageFont.truetype(font_path, 45) if os.path.exists(font_path) else ImageFont.load_default()
+            sub_font = ImageFont.truetype(font_path, 42) if os.path.exists(font_path) else ImageFont.load_default()
 
-            # Обводка для контраста
             for ax in range(-4, 5):
                 for ay in range(-4, 5):
                     draw.text((90 + ax, 180 + ay), song_title.upper(), font=title_font, fill=(0,0,0,255))
@@ -221,7 +254,7 @@ if uploaded_file is not None:
             cover_filename = "youtube_cover.png"
             cover_image.convert("RGB").save(cover_filename, "PNG")
 
-        st.success("🎉 Готово! Обложка и аудио успешно сгенерированы.")
+        st.success("🎉 Готово! Ваш трек настроен и сгенерирован.")
 
         # --- РЕЗУЛЬТАТЫ СКАЧИВАНИЯ ---
         st.subheader("📥 Скачать результаты:")
@@ -235,48 +268,3 @@ if uploaded_file is not None:
             if os.path.exists(safe_audio_path):
                 with open(safe_audio_path, "rb") as aud_file:
                     st.download_button("📥 Скачать аудио (WAV)", aud_file, file_name="remixed_track.wav", mime="audio/wav")
-
-        if os.path.exists(safe_audio_path):
-            st.audio(safe_audio_path, format="audio/wav")
-
-        # --- YOUTUBE SEO & ТЕГИ ---
-        st.markdown("---")
-        st.subheader("🚀 Англоязычное YouTube SEO и Теги")
-        
-        yt_titles = [
-            f"{song_title} [{default_genre_text} Vibe / Audio] | NBS SOFT",
-            f"{artist_name} - {song_title} (Slowed & Reverb / HQ Audio)",
-            f"{song_title} — {default_genre_text} Remix"
-        ]
-        
-        yt_description = f"""🎵 {artist_name} — {song_title}
-🎧 Version: {default_genre_text}
-⚡ Powered by NBS SOFT Studio
-
-Immerse yourself in the ultimate atmosphere. Enjoy the vibe, drop a like, and subscribe for more daily releases!
-
-📌 Follow & Support:
-• Telegram Channel: Your Link Here
-• Spotify / Apple Music: Your Link Here
-
-#️⃣ Hashtags:
-#{song_title.replace(' ', '')} #{default_genre_text.replace(' ', '')} #SlowedAndReverb #Vibes #Music #Audio #Remix #NBSSoft
-"""
-        st.markdown("**💡 Оптимизированные названия для YouTube:**")
-        for t in yt_titles:
-            st.code(t, language="text")
-
-        st.markdown("**📝 SEO Описание для видео:**")
-        st.text_area("Скопируйте описание:", yt_description, height=150)
-
-        # --- СЦЕНАРИЙ ДЛЯ SHORTS / TIKTOK ---
-        st.markdown("---")
-        st.subheader("🎬 Авто-сценарий для вирусных Shorts / TikTok")
-        hook_ideas = [
-            f"«Когда включил этот {default_genre_text} трек и забыл обо всем...»",
-            f"«Этот бит в стиле {default_genre_text} сносит крышу с первых секунд 🎧»",
-            f"«Идеальный трек для ночных поездок и вайба: {song_title}»"
-        ]
-        selected_hook = random.choice(hook_ideas)
-        st.markdown(f"**⚡ Хук (первые 3 секунды видео):**")
-        st.code(selected_hook, language="text")
