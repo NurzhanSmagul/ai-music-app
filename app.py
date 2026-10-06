@@ -163,37 +163,45 @@ if uploaded_file is not None:
 
     if st.button("🚀 Обработать трек и изменить звучание"):
         
-        # --- ОБРАБОТКА АУДИО БЕЗ АРТЕФАКТОВ И ЗАДЕРЖЕК ---
-        with st.spinner("🔄 Зачищаем старт трека, применяем обработку и мастеринг..."):
+        # --- ОБРАБОТКА АУДИО БЕЗ СПЕКТРАЛЬНЫХ АРТЕФАКТОВ («ТЫЫЫЗ») ---
+        with st.spinner("🔄 Устраняем артефакты фазового вокодера, пересобираем звук и мастеринг..."):
             try:
                 # Загружаем трек
                 y, sr = librosa.load(audio_path, sr=None, mono=True)
                 
-                # --- УДАЛЕНИЕ ТЕХНИЧЕСКОГО МУСОРА / ENCODER DELAY В НАЧАЛЕ ---
-                # Обрезаем мертвую зону или артефакты декодера в первые 0.25 секунды
-                start_trim_samples = int(sr * 0.25)
-                if len(y) > start_trim_samples:
-                    y = y[start_trim_samples:]
-                
-                # Также автоматически обрезаем начальную тишину с помощью librosa.effects.trim
-                y, _ = librosa.effects.trim(y, top_db=35)
-
-                # 1. Точный анализ BPM
+                # 1. Анализ BPM на исходнике до любых сдвигов
                 tempo_detected, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
                 if isinstance(tempo_detected, np.ndarray):
                     track_bpm = float(tempo_detected[0])
                 else:
                     track_bpm = float(tempo_detected)
                 
-                # 2. Изменение тональности (Питч)
+                # --- ЗАЩИТА ОТ АРТЕФАКТОВ ПИТЧА И ТЕМПА («ТЫЫЫЗ») ---
+                # Добавляем 1 секунду тишины в начале и в конце перед питч-шифтом и стрейчем,
+                # чтобы спектральный алгоритм librosa «разгонялся» на тишине, а не на срезе аудио.
+                pad_len = int(sr * 1.0)
+                y_padded = np.pad(y, (pad_len, pad_len), mode='constant')
+
+                # 2. Изменение тональности (Питч) на защищенном буфере
                 if pitch_shift != 0.0:
-                    y = librosa.effects.pitch_shift(y, sr=sr, n_steps=pitch_shift, n_fft=2048, hop_length=512)
+                    y_padded = librosa.effects.pitch_shift(y_padded, sr=sr, n_steps=pitch_shift, n_fft=2048, hop_length=512)
                 
                 # 3. Изменение скорости (Темп)
                 if tempo_factor != 1.0:
-                    y = librosa.effects.time_stretch(y, rate=tempo_factor)
+                    y_padded = librosa.effects.time_stretch(y_padded, rate=tempo_factor)
                 
+                # Отрезаем добавленный буфер обратно вместе со всеми возможными артефактами старта
+                effective_pad = int(pad_len * (1.0 / tempo_factor))
+                if len(y_padded) > 2 * effective_pad:
+                    y = y_padded[effective_pad : -effective_pad]
+                else:
+                    y = y_padded
+
                 effective_bpm = track_bpm * tempo_factor
+
+                # Дополнительная зачистка самого первого микро-отрезка (50мс) чистой тишиной с плавным входом
+                if len(y) > int(sr * 0.05):
+                    y[:int(sr * 0.05)] = 0.0
 
                 # Нормализуем исходник перед добавлением эффектов
                 y = y / (np.max(np.abs(y)) + 1e-6) * 0.7
@@ -217,8 +225,8 @@ if uploaded_file is not None:
                     for i, frame in enumerate(adjusted_frames):
                         idx = int(frame)
                         
-                        # Не даем ударным бить раньше 0.3 секунд от старта
-                        if idx < int(sr * 0.3):
+                        # Не позволяем ударным бить раньше 0.4 секунд
+                        if idx < int(sr * 0.4):
                             continue
                             
                         timestamp_sec = round(idx / sr, 2)
@@ -256,8 +264,8 @@ if uploaded_file is not None:
                     noise = np.random.normal(0, vinyl_noise, len(y))
                     y = y + noise
 
-                # --- 8. ИДЕАЛЬНО ЧИСТЫЙ СТАРТ: Абсолютный Fade-In в первые 80 мс ---
-                fade_samples = int(sr * 0.08)
+                # --- АБСОЛЮТНО ЧИСТЫЙ СТАРТ: Плавный Fade-In (100 мс) ---
+                fade_samples = int(sr * 0.1)
                 if len(y) > fade_samples:
                     fade_curve = np.linspace(0.0, 1.0, fade_samples)
                     y[:fade_samples] = y[:fade_samples] * fade_curve
@@ -313,7 +321,7 @@ if uploaded_file is not None:
             cover_image.convert("RGB").save(cover_filename, "PNG")
             st.session_state["ready_cover"] = cover_filename
 
-        st.success(f"🎉 Готово! Измененный BPM: **{st.session_state.get('detected_bpm', 120)}**. Старт трека полностью зачищен!")
+        st.success(f"🎉 Готово! Измененный BPM: **{st.session_state.get('detected_bpm', 120)}**. Артефакты («тыыыз») полностью устранены!")
 
     # --- ОТОБРАЖЕНИЕ РЕЗУЛЬТАТОВ И ТАЙМЛАЙНА ---
     if "ready_cover" in st.session_state and os.path.exists(st.session_state["ready_cover"]):
