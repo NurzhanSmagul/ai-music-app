@@ -23,8 +23,6 @@ import streamlit as st
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 from scipy.signal import butter, oaconvolve, sosfilt
 
-import beatgen
-
 # =====================================================================
 # НАСТРОЙКИ
 # =====================================================================
@@ -38,11 +36,11 @@ COVER_MAX_BYTES = 2 * 1024 * 1024  # лимит YouTube на превью — 2 
 # Жанры: подпись -> параметры (короткое имя, пресет по умолчанию, фото, цвет акцента)
 GENRES = {
     "LO-FI / CHILL MUSIC (Мягкий расслабленный вайб)": {
-        "short": "Lo-Fi", "preset": "Lo-Fi Vinyl", "beat": "lofi",
+        "short": "Lo-Fi", "preset": "Lo-Fi Vinyl",
         "photos": [1060, 1068, 1074, 1081], "accent": (255, 196, 140),
     },
     "SLOWED & REVERB (Глубокий атмосферный замедленный вайб)": {
-        "short": "Slowed + Reverb", "preset": "Slowed & Reverb", "beat": "trap",
+        "short": "Slowed + Reverb", "preset": "Slowed & Reverb",
         "photos": [1047, 1058, 1084, 1039], "accent": (170, 190, 255),
     },
     "PHONK / DRIFT PHONK (Глубокий бас, темный кач)": {
