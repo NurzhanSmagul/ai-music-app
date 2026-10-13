@@ -387,7 +387,7 @@ def separate(y, sr, model):
 # =====================================================================
 
 
-def analyze(y, sr, drums=None, bass=None):
+def analyze(y, sr, drums=None, bass=None, harm=None):
     """Темп, доли, сильная доля и басовые ноты по тактам."""
     import librosa
 
@@ -403,6 +403,17 @@ def analyze(y, sr, drums=None, bass=None):
     beats = np.asarray(beats, dtype=float)
     if len(beats) < 8:
         beats = np.arange(0.0, dur, 60.0 / tempo)
+    else:
+        # Точная подгонка: каждую долю подтягиваем к ближайшей реальной атаке (до 35 мс),
+        # смещения сглаживаем, чтобы сетка не дёргалась
+        peaks = librosa.util.peak_pick(env, pre_max=3, post_max=3, pre_avg=5, post_avg=5,
+                                       delta=float(env.std()) * .2, wait=3)
+        ptimes = librosa.frames_to_time(peaks, sr=sr, hop_length=hop)
+        if len(ptimes) > 1:
+            j = np.clip(np.searchsorted(ptimes, beats), 1, len(ptimes) - 1)
+            near = np.where(np.abs(ptimes[j - 1] - beats) < np.abs(ptimes[j] - beats), ptimes[j - 1], ptimes[j])
+            off = np.where(np.abs(near - beats) < .035, near - beats, 0.0)
+            beats = np.maximum.accumulate(beats + np.convolve(off, np.ones(8) / 8, mode="same"))
 
     # Сильная доля — та из четырёх, где больше всего атак в басу (бочка)
     low_env = librosa.onset.onset_strength(y=_lowpass(rhythm, sr, 150), sr=sr, hop_length=hop)
@@ -433,10 +444,18 @@ def analyze(y, sr, drums=None, bass=None):
         if not strong[i]:
             roots[i] = roots[i - 1] if i else key
 
+    # Аккорды: мажор или минор над басовой нотой каждого такта (по гармонии трека)
+    hsrc = harm.mean(0) if harm is not None else mono
+    hc = librosa.feature.chroma_cqt(y=librosa.resample(hsrc, orig_sr=sr, target_sr=22050), sr=22050, hop_length=1024)
+    ht = librosa.frames_to_time(np.arange(hc.shape[1]), sr=22050, hop_length=1024)
+    hseg = np.zeros((nseg, 12))
+    np.add.at(hseg, np.clip(np.searchsorted(edges, ht, side="right") - 1, 0, nseg - 1), hc.T)
+    minor = np.array([hseg[i, (roots[i] + 3) % 12] > hseg[i, (roots[i] + 4) % 12] for i in range(nseg)])
+
     return {
         "tempo": 60.0 / float(np.median(np.diff(beats))),
         "beats": beats, "phase": phase, "bar_edges": edges,
-        "roots": roots.astype(int), "key": key,
+        "roots": roots.astype(int), "key": key, "minor": minor,
     }
 
 
@@ -732,8 +751,125 @@ def _place(bus, x, t, gain, sr, pan=0.0):
 # =====================================================================
 
 
+# ---------- Музыкальные слои: аккорды, клавиши, эхо, переходы ----------
+
+LAYER_STYLES = {
+    #        громкость пэда/клавиш, инструмент клавиш, яркость пэда, септаккорды
+    "lofi":  {"pad": .25, "keys": .55, "keys_type": "rhodes", "bright": .2, "seventh": True, "echo": .25},
+    "phonk": {"pad": .35, "keys": .30, "keys_type": "bell",   "bright": .1, "seventh": False, "echo": .35},
+    "trap":  {"pad": .30, "keys": .45, "keys_type": "bell",   "bright": .3, "seventh": False, "echo": .35},
+    "house": {"pad": .30, "keys": .50, "keys_type": "organ",  "bright": .4, "seventh": True, "echo": .20},
+    "synth": {"pad": .45, "keys": .45, "keys_type": "arp",    "bright": .6, "seventh": True, "echo": .30},
+    "dance": {"pad": .35, "keys": .50, "keys_type": "pluck",  "bright": .5, "seventh": False, "echo": .30},
+}
+# режим, шаги (для аккордов — пары «шаг, длина»), длина ноты в шагах
+KEY_PATTERNS = {
+    "rhodes": ("chord", [(0, 6), (7, 5)], None),
+    "organ":  ("chord", [(2, 1.5), (6, 1.5), (10, 1.5), (14, 1.5)], None),
+    "bell":   ("arp", [0, 3, 6, 10, 12], 3),
+    "arp":    ("arp", list(range(16)), 1),
+    "pluck":  ("arp", [0, 2, 3, 6, 8, 10, 11, 14], 1.5),
+}
+
+
+def _chord_at(an, t):
+    i = int(np.clip(np.searchsorted(an["bar_edges"], t, side="right") - 1, 0, len(an["roots"]) - 1))
+    minor = an.get("minor")
+    return int(an["roots"][i]), bool(minor[i]) if minor is not None else False
+
+
+def chord_name(root, minor):
+    return NOTE_NAMES[root % 12] + ("m" if minor else "")
+
+
+def _chord_tones(root, minor, seventh):
+    tones = [0, 3 if minor else 4, 7] + ([10 if minor else 11] if seventh else [])
+    return [root + x for x in tones]
+
+
+def _saw(f, t, phase0=0.0):
+    return 2 * ((f * t + phase0) % 1) - 1
+
+
+def _synth_pad(midis, dur, sr, bright, rng):
+    """Широкий пэд: по три расстроенных пилы на ноту, разные в левом и правом канале."""
+    n = int(dur * sr)
+    t = np.arange(n) / sr
+    out = np.zeros((2, n))
+    for m in midis:
+        f = _hz(m)
+        for ch, cents in ((0, (-9, 0, 9)), (1, (-7, 2, 11))):
+            for c in cents:
+                out[ch] += _saw(f * 2 ** (c / 1200), t, rng.random())
+    out = sosfilt(_sos("low", 700 + 2500 * bright, sr), out, axis=-1)
+    env = np.ones(n)
+    na, nr = int(min(.5, dur * .3) * sr), int(min(.6, dur * .4) * sr)
+    if na:
+        env[:na] = np.linspace(0, 1, na)
+    if nr:
+        env[-nr:] *= np.linspace(1, 0, nr)
+    return (out * env / (3 * len(midis))).astype(np.float32)
+
+
+def _note(kind, midi, dur, sr):
+    n = int(max(dur, .05) * sr)
+    t = np.arange(n) / sr
+    f = _hz(midi)
+    w = 2 * np.pi * f * t
+    if kind == "rhodes":     # электропиано: мягкая FM-атака и тремоло
+        x = np.sin(w + 1.2 * np.exp(-t / .25) * np.sin(w)) + .25 * np.sin(2 * w) * np.exp(-t / .4)
+        x *= np.exp(-t / 1.4) * (1 + .15 * np.sin(2 * np.pi * 4.5 * t))
+    elif kind == "bell":     # колокольчик (FM)
+        x = np.sin(w + 2.5 * np.exp(-t / .5) * np.sin(3.5 * w)) * np.exp(-t / .9)
+    elif kind == "organ":    # хаус-орган, короткий стаб
+        x = (np.sin(w) + .5 * np.sin(2 * w) + .3 * np.sin(3 * w) + .2 * np.sin(4 * w)) / 2 * np.exp(-t / .35)
+    elif kind == "pluck":
+        x = sosfilt(_sos("low", min(f * 6, 8000), sr), _saw(f, t)) * np.exp(-t / .22) + .3 * np.sin(w) * np.exp(-t / .3)
+    else:                    # арпеджио-синт
+        x = sosfilt(_sos("low", min(f * 8, 9000), sr), .6 * np.sign(np.sin(w)) + .4 * _saw(f * 1.005, t, .3)) * np.exp(-t / .16)
+    nr = int(min(.03, dur / 4) * sr)
+    if nr > 0:
+        x[-nr:] *= np.linspace(1, 0, nr)
+    return x.astype(np.float32)
+
+
+def _riser(dur, sr, rng):
+    """Шумовой райзер: полоса фильтра поднимается от 400 Гц до 8 кГц, громкость растёт."""
+    n = int(dur * sr)
+    if n < 100:
+        return np.zeros(0, np.float32)
+    x, out, chunks = rng.standard_normal(n), np.zeros(n), 24
+    for c in range(chunks):
+        a, b = c * n // chunks, (c + 1) * n // chunks
+        f = 400 * 20 ** (c / (chunks - 1))
+        out[a:b] = sosfilt(_sos("band", [f / 1.6, f * 1.6], sr), x[a:b])
+    out /= np.max(np.abs(out)) + 1e-9
+    return (out * (np.arange(n) / n) ** 2).astype(np.float32)
+
+
+def _impact(sr):
+    t = np.arange(int(1.4 * sr)) / sr
+    f = 32 + 30 * np.exp(-t / .08)
+    return (np.sin(2 * np.pi * np.cumsum(f) / sr) * np.exp(-t / .45)).astype(np.float32)
+
+
+def _ping_pong_echo(bus, sr, bpm, amount):
+    """Эхо в темп трека (пунктирная восьмая), по очереди слева и справа."""
+    if amount <= 0:
+        return bus
+    n, delay = bus.shape[1], int(.75 * 60 / bpm * sr)
+    src, wet = bus.mean(0), np.zeros_like(bus)
+    src = _lowpass(src, sr, 5000)
+    for tap in range(1, 5):
+        sh = delay * tap
+        if sh >= n:
+            break
+        wet[tap % 2, sh:] += src[:n - sh] * (.3 + .3 * amount) ** tap * 1.6
+    return bus + wet * amount
+
+
 def render_beat_mix(y, sr, an, style, *, bed=None, vol=.9, filter_amt=.35, side=.3,
-                    density=.5, new_bass=True, seed=1, scale=1):
+                    density=.5, new_bass=True, seed=1, scale=1, layers=None):
     """Возвращает (новый микс той же длины, что y; инфо для интерфейса).
 
     bed — дорожки после Demucs: {"main": вокал + остальное, "bass": бас}. Без них старый бит
@@ -759,17 +895,28 @@ def render_beat_mix(y, sr, an, style, *, bed=None, vol=.9, filter_amt=.35, side=
     bar_len = _time_at(grid, start + bpb) - _time_at(grid, start)
     intro = 1 if bar_len > 3 else 2
 
+    lay = layers or {}
+    fx_on = lay.get("on") and lay.get("fx")
+    section = 8 if bar_len >= 3 else 16          # новая часть примерно каждые 40 секунд
+    is_drop = lambda kk: kk == intro or (kk > intro and (kk - intro) % section == 0)  # noqa: E731
+    bars, drops = [], []
+
     k = 0
     while True:
         b0 = start + k * bpb
         t0 = _time_at(grid, b0)
         if t0 >= dur:
             break
+        bars.append((k, b0))
         use_b = (k // 4) % 2 == 1
         evs = (FB if use_b else FA) if k % 4 == 3 else (B if use_b else A)
         if k < intro:
             evs = [ev for ev in evs if ev["i"] in ("hat", "ohat", "shaker", "cowbell")]
-        if t0 >= 0 and (k == intro or (k > intro and (k - intro) % 8 == 0)):
+        elif fx_on and is_drop(k + 1):
+            # брейк: вторая половина такта перед дропом без бочки и баса — дроп бьёт сильнее
+            evs = [ev for ev in evs if ev["s"] < 8 or ev["i"] in ("hat", "snare", "clap", "tom")]
+        if t0 >= 0 and is_drop(k):
+            drops.append(t0)
             _place(drums, kit.get("crash"), t0, 1.0, sr)
         for ev in evs:
             pos = b0 + ev["s"] / 16 * bpb
@@ -816,6 +963,80 @@ def render_beat_mix(y, sr, an, style, *, bed=None, vol=.9, filter_amt=.35, side=
     if st_.get("lofi"):
         drums = _lowpass(drums, sr, 6500).astype(np.float32)
 
+    # Музыкальные слои по аккордам трека
+    layer_bus = np.zeros((2, n), np.float32)
+    fx_bus = np.zeros((2, n), np.float32)
+    nrng = np.random.default_rng(seed)
+    if lay.get("on"):
+        cfg = LAYER_STYLES[style]
+        # Пэд: аккорд на каждый такт песни, вступает с первого дропа
+        if lay.get("pad", 0) > 0:
+            pad_bus = np.zeros((2, n), np.float32)
+            starts = [s for s in an["bar_edges"][1:-1] if s < dur]
+            if not starts or starts[0] > 0:
+                starts = [0.0] + starts
+            pad_from = drops[0] if drops else 0.0
+            for i, bs in enumerate(starts):
+                be = starts[i + 1] if i + 1 < len(starts) else dur
+                if be <= pad_from:
+                    continue
+                s0 = max(bs, pad_from)
+                root, minor = _chord_at(an, (bs + be) / 2)
+                base = 48 + root + (12 if 48 + root < 52 else 0)
+                midis = [base - 12] + _chord_tones(base, minor, cfg["seventh"])
+                x = _synth_pad(midis, be - s0 + .35, sr, cfg["bright"], nrng)
+                i0 = int(s0 * sr)
+                m = min(x.shape[1], n - i0)
+                if m > 0:
+                    pad_bus[:, i0:i0 + m] += x[:, :m]
+            layer_bus += pad_bus * lay["pad"]
+        # Клавиши / арпеджио: в такт паттерна, с первого такта
+        if lay.get("keys", 0) > 0:
+            keys_bus = np.zeros((2, n), np.float32)
+            kind = cfg["keys_type"]
+            mode, steps, note_len = KEY_PATTERNS[kind]
+            if style == "phonk":
+                steps = [0, 6, 12] + ([3, 9] if density > .6 else [])
+            arp_i = 0
+            for kk, b0 in bars:
+                step_sec = (_time_at(grid, b0 + bpb) - _time_at(grid, b0)) / 16
+                for item in steps:
+                    s, length = item if mode == "chord" else (item, note_len)
+                    t = _time_at(grid, b0 + s / 16 * bpb)
+                    if t < 0 or t >= dur - .05:
+                        continue
+                    root, minor = _chord_at(an, t)
+                    tail = .5 if kind in ("rhodes", "bell") else .05
+                    if mode == "chord":
+                        base = 48 + root + (12 if 48 + root < 52 else 0)
+                        for v, midi in enumerate(_chord_tones(base, minor, cfg["seventh"])):
+                            _place(keys_bus, _note(kind, midi, length * step_sec + tail, sr), t + .012 * v, .22, sr,
+                                   (v - 1.5) * .15)
+                    else:
+                        tones = _chord_tones(root, minor, cfg["seventh"])
+                        ladder = tones + [x + 12 for x in tones]
+                        if kk % 2:
+                            ladder = ladder[::-1]           # каждый второй такт арпеджио идёт вниз
+                        midi = 72 + ladder[arp_i % len(ladder)] - (12 if 72 + root > 79 else 0)
+                        arp_i += 1
+                        _place(keys_bus, _note(kind, midi, length * step_sec + tail, sr), t, .35, sr,
+                               .25 if arp_i % 2 else -.25)
+            keys_bus = _ping_pong_echo(keys_bus, sr, bpm, lay.get("echo", 0))
+            layer_bus += keys_bus * lay["keys"]
+        # Общий зал для слоёв
+        if np.any(layer_bus):
+            layer_bus = apply_reverb(layer_bus, sr, .4)[:, :n].astype(np.float32)
+        # Переходы: райзер и реверс-тарелка перед дропом, низкий удар на дропе
+        if lay.get("fx"):
+            crash_rev = kit.get("crash")[::-1]
+            for d_t in drops:
+                rl = min(4.0, bar_len)
+                if d_t - rl > 0:
+                    _place(fx_bus, _riser(rl, sr, nrng), d_t - rl, .22, sr)
+                if d_t - len(crash_rev) / sr > 0:
+                    _place(fx_bus, crash_rev, d_t - len(crash_rev) / sr, .5, sr)
+                _place(fx_bus, _impact(sr), d_t, .55, sr)
+
     # Подложка: дорожки без барабанов или исходный трек под фильтром
     if bed is not None:
         music = bed["main"] + (0 if new_bass else bed["bass"])
@@ -846,15 +1067,31 @@ def render_beat_mix(y, sr, an, style, *, bed=None, vol=.9, filter_amt=.35, side=
             if m > 0:
                 duck[i0:i0 + m] = np.minimum(duck[i0:i0 + m], curve[:m])
 
-    mix = music * duck + (drums + bass_bus) * vol
-    peak = np.max(np.abs(mix))
-    if peak > .95:
+    if lay.get("on") and lay.get("polish"):
+        # шире стерео для слоёв
+        mid, sid = layer_bus.mean(0), (layer_bus[0] - layer_bus[1]) / 2 * 1.5
+        layer_bus = np.stack([mid + sid, mid - sid])
+    soft_duck = 1 - (1 - duck) * .7               # слои качаются мягче подложки
+    mix = music * duck + (drums + bass_bus) * vol + layer_bus * soft_duck + fx_bus
+    peak = np.max(np.abs(mix)) + 1e-9
+    if lay.get("on") and lay.get("polish"):
+        # склейка: мягкая сатурация собирает бит, бас и музыку в один звук
+        mix = np.tanh(mix / peak * 1.3) / np.tanh(1.3) * .95
+    elif peak > .95:
         mix *= .95 / peak
     if y.shape[0] == 1:
         mix = mix.mean(0, keepdims=True)
 
+    names = []
+    for i in range(1, len(an["roots"])):
+        name = chord_name(*_chord_at(an, (an["bar_edges"][i] + min(an["bar_edges"][i + 1], dur)) / 2))
+        if not names or names[-1] != name:
+            names.append(name)
+        if len(names) == 8:
+            break
     info = {"style": st_["name"], "bpm": bpm, "mult": mult, "key": NOTE_NAMES[an["key"]],
-            "pattern": pattern_text(A), "separated": bed is not None}
+            "pattern": pattern_text(A), "separated": bed is not None,
+            "chords": " → ".join(names), "drops": len(drops)}
     return mix.astype(np.float32), info
 
 
@@ -1095,6 +1332,10 @@ def render_results(res):
                   None if abs(beat["bpm_out"] - beat["bpm"]) < .05 else f"{beat['bpm_out'] - beat['bpm']:+.1f}")
         c2.metric("Бас трека", beat["key"])
         c3.metric("Старые барабаны", "вырезаны" if beat["separated"] else "приглушены")
+        if beat.get("chords"):
+            st.markdown(f"**🎹 Аккорды трека:** {beat['chords']}")
+        if beat.get("drops"):
+            st.caption(f"Дропов в аранжировке: {beat['drops']}")
         st.code(beat["pattern"], language="text")
 
     cols = st.columns(3 if res.get("mp3") else 2)
@@ -1218,6 +1459,20 @@ def main():
         c2.button("🎲 Другая", on_click=lambda: st.session_state.update(beat_seed=random.randint(1, 99999)))
     beat_scale = {"Как найден": 1, "½× (в 2 раза медленнее)": 0.5}.get(tempo_choice, 2)
 
+    lst = LAYER_STYLES[style_key]
+    keys_names = {"rhodes": "электропиано", "bell": "колокольчики", "organ": "хаус-орган",
+                  "arp": "арпеджио-синт", "pluck": "плак-синт"}
+    layers_on = st.checkbox("🎹 Добавить музыкальные слои по аккордам трека", value=True, disabled=not beat_on,
+                            help="Аккорды и мелодия строятся по басовым нотам и гармонии трека, поэтому звучат в его тональности.")
+    with st.expander("Слои, переходы и сведение"):
+        layer_pad = st.slider("Аккорды (пэд)", 0.0, 1.0, lst["pad"], 0.05, key=f"lpad_{kb}")
+        layer_keys = st.slider(f"Клавиши: {keys_names[lst['keys_type']]}", 0.0, 1.0, lst["keys"], 0.05, key=f"lkeys_{kb}")
+        layer_echo = st.slider("Эхо в темп", 0.0, 1.0, lst["echo"], 0.05, key=f"lecho_{kb}")
+        layer_fx = st.checkbox("Переходы: брейк, райзер, реверс-тарелка и удар на дропе", value=True, key=f"lfx_{kb}")
+        layer_polish = st.checkbox("Красивое сведение: склейка и широкое стерео", value=True, key=f"lpol_{kb}")
+    layers = dict(on=beat_on and layers_on, pad=layer_pad, keys=layer_keys, echo=layer_echo,
+                  fx=layer_fx, polish=layer_polish)
+
     if st.button("🚀 Создать ремикс, обложку и SEO", type="primary"):
         if not song_title.strip():
             st.warning("Введите название трека.")
@@ -1252,7 +1507,8 @@ def main():
                                 st.warning(f"Demucs не сработал ({err}). Приглушаю старый бит фильтром.")
                         st.write("📈 Ищем темп, сильные доли и басовые ноты…")
                         analysis = analyze(y, sr, drums=stems["drums"] if stems else None,
-                                                   bass=stems["bass"] if stems else None)
+                                           bass=stems["bass"] if stems else None,
+                                           harm=stems["other"] if stems else None)
                         bed = {"main": stems["vocals"] + stems["other"], "bass": stems["bass"]} if stems else None
                         cache = {"key": cache_key, "analysis": analysis, "bed": bed}
                         st.session_state["beat_cache"] = cache
@@ -1260,7 +1516,8 @@ def main():
                     y, beat_info = render_beat_mix(
                         y, sr, cache["analysis"], style_key, bed=cache["bed"], vol=beat_vol,
                         filter_amt=beat_filter, side=beat_side, density=beat_density,
-                        new_bass=beat_bass, seed=int(st.session_state["beat_seed"]), scale=beat_scale)
+                        new_bass=beat_bass, seed=int(st.session_state["beat_seed"]), scale=beat_scale,
+                        layers=layers)
                     beat_info["bpm_out"] = beat_info["bpm"] * (speed if link else tempo)
 
                 st.write("🎚️ Применяем эффекты…")
