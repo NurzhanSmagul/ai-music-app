@@ -21,7 +21,7 @@ import requests
 import soundfile as sf
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
-from scipy.signal import butter, oaconvolve, sosfilt
+from scipy.signal import butter, lfilter, oaconvolve, sosfilt
 
 
 # =====================================================================
@@ -259,12 +259,288 @@ def apply_fades(y, sr, fade_in=0.02, fade_out=0.05):
     return y
 
 
-def process_audio(y, sr, s):
+# =====================================================================
+# ЭФФЕКТЫ (массивы (2, сэмплы); bpm нужен эффектам «в темп»)
+# =====================================================================
+
+FX_DEFAULTS = dict(
+    eq_low=0.0, eq_mid=0.0, eq_high=0.0, hp=20, lp=20000,
+    saturation=0.0, distortion=0.0, bitcrush=0.0, radio=0.0,
+    chorus=0.0, flanger=0.0, phaser=0.0, autofilter=0.0, tremolo=0.0,
+    eight_d=0.0, autopan=0.0, width=1.0, echo=0.0, echo_beats=0.75, echo_fb=0.4, room=0.0,
+    gate=0.0, comp=0.0, tapestop=0.0,
+)
+FX_PRESETS = {
+    "Без эффектов": {},
+    "🎧 8D Audio": {"eight_d": .9, "room": .35, "width": 1.2},
+    "🌙 Мечтательный": {"chorus": .45, "echo": .35, "room": .4, "eq_high": 2.0, "width": 1.5},
+    "🌊 Под водой": {"lp": 700, "chorus": .5, "room": .5, "eq_low": 4.0},
+    "📼 Кассета": {"saturation": .4, "chorus": .2, "lp": 9000, "eq_high": -3.0},
+    "📻 Радио 90-х": {"radio": .8, "saturation": .3, "room": .15},
+    "📞 Телефон": {"radio": 1.0, "bitcrush": .3},
+    "🖤 Тёмный фонк": {"distortion": .25, "eq_low": 5.0, "comp": .5, "lp": 12000},
+    "🔊 Клубный памп": {"comp": .6, "autofilter": .4, "eq_low": 3.0, "width": 1.3},
+    "⚡ Транс-гейт": {"gate": .8, "echo": .3, "echo_beats": .5},
+    "🕹️ Ретро 8-бит": {"bitcrush": .8, "gate": .3},
+    "🌀 Психоделика": {"phaser": .7, "flanger": .4, "autopan": .5, "echo": .3},
+    "⏹️ Тейп-стоп в конце": {"tapestop": .6},
+}
+FX_NAMES = {
+    "eq_low": "низы", "eq_mid": "середина", "eq_high": "верха", "hp": "срез низов", "lp": "срез верхов",
+    "saturation": "ламповая теплота", "distortion": "дисторшн", "bitcrush": "биткраш", "radio": "радио",
+    "chorus": "хорус", "flanger": "фленжер", "phaser": "фэйзер", "autofilter": "свип-фильтр",
+    "tremolo": "тремоло", "eight_d": "8D", "autopan": "автопанорама", "width": "ширина стерео",
+    "echo": "эхо", "room": "зал", "gate": "транс-гейт", "comp": "компрессор", "tapestop": "тейп-стоп",
+}
+SYNCED_FX = ("echo", "gate", "tremolo", "autofilter", "autopan")
+
+
+def active_fx(fx):
+    out = []
+    for k, v in fx.items():
+        d = FX_DEFAULTS.get(k)
+        if k in FX_NAMES and d is not None and abs(float(v) - float(d)) > 1e-6:
+            out.append(FX_NAMES[k])
+    return out
+
+
+def _rbj(kind, f0, sr, gain_db=0.0, q=0.707):
+    """Биквад-фильтры по RBJ Audio EQ Cookbook, в формате sos."""
+    A = 10 ** (gain_db / 40)
+    w = 2 * np.pi * min(max(f0, 20.0), sr * .45) / sr
+    cw, sw = np.cos(w), np.sin(w)
+    alpha = sw / (2 * q)
+    if kind in ("lowshelf", "highshelf"):
+        sa = 2 * np.sqrt(A) * alpha
+        if kind == "lowshelf":
+            b = [A * ((A + 1) - (A - 1) * cw + sa), 2 * A * ((A - 1) - (A + 1) * cw), A * ((A + 1) - (A - 1) * cw - sa)]
+            a = [(A + 1) + (A - 1) * cw + sa, -2 * ((A - 1) + (A + 1) * cw), (A + 1) + (A - 1) * cw - sa]
+        else:
+            b = [A * ((A + 1) + (A - 1) * cw + sa), -2 * A * ((A - 1) + (A + 1) * cw), A * ((A + 1) + (A - 1) * cw - sa)]
+            a = [(A + 1) - (A - 1) * cw + sa, 2 * ((A - 1) - (A + 1) * cw), (A + 1) - (A - 1) * cw - sa]
+    elif kind == "peak":
+        b = [1 + alpha * A, -2 * cw, 1 - alpha * A]
+        a = [1 + alpha / A, -2 * cw, 1 - alpha / A]
+    else:  # резонансный лоупасс
+        b = [(1 - cw) / 2, 1 - cw, (1 - cw) / 2]
+        a = [1 + alpha, -2 * cw, 1 - alpha]
+    b, a = np.array(b) / a[0], np.array(a) / a[0]
+    return np.concatenate([b, a])[None, :]
+
+
+def _one_pole(x, sr, seconds):
+    a = np.exp(-1 / (sr * seconds))
+    return lfilter([1 - a], [1, -a], x, axis=-1)
+
+
+def _match_level(new, ref):
+    return new * (np.max(np.abs(ref)) / (np.max(np.abs(new)) + 1e-9))
+
+
+def fx_eq(y, sr, low, mid, high):
+    if low:
+        y = sosfilt(_rbj("lowshelf", 120, sr, low), y, axis=-1)
+    if mid:
+        y = sosfilt(_rbj("peak", 1000, sr, mid, q=.8), y, axis=-1)
+    if high:
+        y = sosfilt(_rbj("highshelf", 6000, sr, high), y, axis=-1)
+    return y
+
+
+def fx_compressor(y, sr, amount):
+    thr_db, ratio = -10 - 20 * amount, 2 + 6 * amount
+    env = _one_pole(np.max(np.abs(y), axis=0), sr, .08)
+    over = np.maximum(0, 20 * np.log10(env + 1e-9) - thr_db)
+    gain = 10 ** (-over * (1 - 1 / ratio) / 20)
+    makeup = 10 ** (-thr_db * (1 - 1 / ratio) * .4 / 20)
+    return y * gain * makeup
+
+
+def fx_saturation(y, amount):
+    d = 1 + 4 * amount
+    return np.tanh(y * d) / np.tanh(d)
+
+
+def fx_distortion(y, sr, amount):
+    dist = lowpass(np.clip(y * (1 + 20 * amount), -1, 1), sr, 6000)
+    m = min(1.0, amount * 1.2)
+    return (1 - m) * y + m * _match_level(dist, y)
+
+
+def fx_bitcrush(y, amount):
+    q = 2 ** (15 - 11 * amount)
+    y = np.round(y * q) / q
+    hold = 1 + int(amount * 15)
+    if hold > 1:
+        y = np.repeat(y[:, ::hold], hold, axis=1)[:, :y.shape[1]]
+    return y
+
+
+def fx_radio(y, sr, amount):
+    band = sosfilt(butter(2, [350, 3200], btype="band", fs=sr, output="sos"), y, axis=-1)
+    band = np.tanh(band * 3) / np.tanh(3)
+    return y * (1 - amount) + _match_level(band, y) * amount
+
+
+def fx_mod_delay(y, sr, base_ms, depth_ms, rate, mix):
+    """Модулированная задержка: основа хоруса и фленжера."""
+    n = y.shape[1]
+    idx = np.arange(n, dtype=np.float64)
+    out = np.empty_like(y)
+    for c in range(y.shape[0]):
+        d = (base_ms + depth_ms * np.sin(2 * np.pi * rate * idx / sr + c * np.pi / 2)) / 1000 * sr
+        out[c] = np.interp(idx - d, idx, y[c], left=0.0)
+    return y + out * mix
+
+
+def fx_phaser(y, sr, amount):
+    n, B = y.shape[1], 1024
+    out = np.empty_like(y)
+    zi = np.zeros((4, y.shape[0], 1))
+    for s0 in range(0, n, B):
+        f = 300 * 6 ** (.5 + .5 * np.sin(2 * np.pi * .35 * s0 / sr))
+        t = np.tan(np.pi * f / sr)
+        c = (t - 1) / (t + 1)
+        x = y[:, s0:s0 + B]
+        for k in range(4):
+            x, zi[k] = lfilter([c, 1.0], [1.0, c], x, axis=-1, zi=zi[k])
+        out[:, s0:s0 + B] = x
+    return y * (1 - amount * .5) + out * amount * .5
+
+
+def fx_autofilter(y, sr, amount, bpm):
+    n, B = y.shape[1], 512
+    out = np.empty_like(y)
+    zi = np.zeros((1, y.shape[0], 2))
+    rate = bpm / 60 / 8                            # один проход фильтра за 2 такта
+    for s0 in range(0, n, B):
+        f = 300 * 30 ** (.5 + .5 * np.sin(2 * np.pi * rate * s0 / sr - np.pi / 2))
+        out[:, s0:s0 + B], zi = sosfilt(_rbj("low", f, sr, q=2.5), y[:, s0:s0 + B], axis=-1, zi=zi)
+    return y * (1 - amount) + out * amount
+
+
+def fx_tremolo(y, sr, amount, bpm):
+    t = np.arange(y.shape[1]) / sr
+    return y * (1 - amount * .5 * (1 + np.sin(2 * np.pi * bpm / 60 * 2 * t)))
+
+
+def fx_gate(y, sr, amount, bpm):
+    pattern = np.array([1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 0], float)
+    step = 60 / bpm / 4
+    env = pattern[(np.arange(y.shape[1]) / sr / step).astype(int) % 16]
+    env = _one_pole(env, sr, .004)
+    return y * (1 - amount + amount * env)
+
+
+def fx_eight_d(y, sr, amount):
+    """8D: звук плавно облетает голову; «сзади» он темнее и тише."""
+    t = np.arange(y.shape[1]) / sr
+    th = 2 * np.pi * .12 * t
+    mid = y.mean(0)
+    behind = (1 - np.cos(th)) / 2
+    src = mid * (1 - .6 * behind) + lowpass(mid, sr, 2500) * .6 * behind
+    pan = (np.sin(th) + 1) * np.pi / 4
+    rot = np.stack([src * np.cos(pan), src * np.sin(pan)]) * np.sqrt(2)
+    return y * (1 - amount) + rot * amount
+
+
+def fx_autopan(y, sr, amount, bpm):
+    g = amount * np.sin(2 * np.pi * bpm / 60 / 4 * np.arange(y.shape[1]) / sr)
+    return np.stack([y[0] * (1 - np.maximum(g, 0)), y[1] * (1 + np.minimum(g, 0))])
+
+
+def fx_width(y, w):
+    mid, side = y.mean(0), (y[0] - y[1]) / 2 * w
+    return np.stack([mid + side, mid - side])
+
+
+def fx_echo(y, sr, amount, beats, fb, bpm):
+    n, delay = y.shape[1], int(beats * 60 / bpm * sr)
+    src = lowpass(y.mean(0), sr, 6000)
+    wet, g = np.zeros_like(y), 1.0
+    for k in range(1, 7):
+        sh = delay * k
+        if delay <= 0 or sh >= n:
+            break
+        g *= fb
+        wet[k % 2, sh:] += src[:n - sh] * g
+    return y + wet * amount * 1.5
+
+
+def fx_tape_stop(y, sr, amount):
+    T = .5 + 2 * amount
+    m, n = int(T * sr), y.shape[1]
+    if m >= n:
+        return y
+    tt = np.arange(m) / sr
+    src_idx = (n - m) + (tt - tt ** 2 / (2 * T)) * sr  # плёнка замедляется до полной остановки
+    out = y.copy()
+    base = np.arange(n, dtype=np.float64)
+    for c in range(y.shape[0]):
+        out[c, n - m:] = np.interp(src_idx, base, y[c])
+    return out
+
+
+def apply_effects(y, sr, fx, bpm):
+    f = {**FX_DEFAULTS, **(fx or {})}
+    if f["hp"] > 25:
+        y = highpass(y, sr, f["hp"], order=4)
+    if f["lp"] < 19000:
+        y = lowpass(y, sr, f["lp"], order=4)
+    y = fx_eq(y, sr, f["eq_low"], f["eq_mid"], f["eq_high"])
+    if f["saturation"] > 0:
+        y = fx_saturation(y, f["saturation"])
+    if f["distortion"] > 0:
+        y = fx_distortion(y, sr, f["distortion"])
+    if f["radio"] > 0:
+        y = fx_radio(y, sr, f["radio"])
+    if f["bitcrush"] > 0:
+        y = fx_bitcrush(y, f["bitcrush"])
+    if f["chorus"] > 0:
+        y = fx_mod_delay(y, sr, 18, 6, .9, .7 * f["chorus"])
+    if f["flanger"] > 0:
+        y = fx_mod_delay(y, sr, 2.5, 2, .25, .8 * f["flanger"])
+    if f["phaser"] > 0:
+        y = fx_phaser(y, sr, f["phaser"])
+    if f["autofilter"] > 0:
+        y = fx_autofilter(y, sr, f["autofilter"], bpm)
+    if f["tremolo"] > 0:
+        y = fx_tremolo(y, sr, f["tremolo"], bpm)
+    if f["gate"] > 0:
+        y = fx_gate(y, sr, f["gate"], bpm)
+    if f["comp"] > 0:
+        y = fx_compressor(y, sr, f["comp"])
+    return y
+
+
+def apply_space(y, sr, fx, bpm):
+    f = {**FX_DEFAULTS, **(fx or {})}
+    if f["eight_d"] > 0:
+        y = fx_eight_d(y, sr, f["eight_d"])
+    if f["autopan"] > 0:
+        y = fx_autopan(y, sr, f["autopan"], bpm)
+    if abs(f["width"] - 1) > 1e-3:
+        y = fx_width(y, f["width"])
+    if f["echo"] > 0:
+        y = fx_echo(y, sr, f["echo"], f["echo_beats"], f["echo_fb"], bpm)
+    if f["room"] > 0:
+        y = apply_reverb(y, sr, f["room"], seed=23)
+    return y
+
+
+def process_audio(y, sr, s, fx=None, bpm=120.0):
+    if y.shape[0] == 1:
+        y = np.repeat(y, 2, axis=0)
     if s["link"]:
         y = change_speed(y, sr, s["speed"])
     else:
         y = shift_pitch_and_tempo(y, sr, s["pitch"], s["tempo"])
+    y = normalize(y, -3.0)
+    y = apply_effects(y, sr, fx, bpm)
     y = bass_boost(y, sr, s["bass"])
+    if fx and fx.get("tapestop", 0) > 0:
+        y = fx_tape_stop(y, sr, fx["tapestop"])   # до зала: хвост ревербера звучит после остановки
+    y = apply_space(y, sr, fx, bpm)
     y = apply_reverb(y, sr, s["reverb"])
     y = normalize(y, -3.0)
     y = apply_vinyl(y, sr, s["vinyl"])
@@ -1287,9 +1563,94 @@ def slugify(text):
 # =====================================================================
 
 
+# =====================================================================
+# ДИЗАЙН: NBS SOFT MUSIC
+# =====================================================================
+
+NBS_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700&family=Manrope:wght@400;500;600;700&display=swap');
+:root {
+  --nbs-bg: #0d0b14; --nbs-panel: rgba(23, 18, 34, .78); --nbs-line: #2b2440;
+  --nbs-fg: #ece7f5; --nbs-muted: #a39bb8; --nbs-lilac: #b8a4ff; --nbs-peach: #ffb59c;
+}
+.stApp {
+  background:
+    radial-gradient(1100px 560px at 90% -12%, rgba(184,164,255,.16), transparent 60%),
+    radial-gradient(900px 520px at -15% 105%, rgba(255,181,156,.10), transparent 60%),
+    var(--nbs-bg);
+}
+.stApp, .stApp p, .stApp label, .stApp li { font-family: 'Manrope', system-ui, sans-serif; }
+.stApp h1, .stApp h2, .stApp h3 { font-family: 'Unbounded', 'Manrope', sans-serif !important; letter-spacing: -.01em; }
+.stApp h3 { font-size: 1.02rem !important; font-weight: 600 !important; }
+#MainMenu, footer { visibility: hidden; }
+[data-testid="stSidebar"] { background: linear-gradient(180deg, #140f1f, #0d0b14); border-right: 1px solid var(--nbs-line); }
+[data-testid="stVerticalBlockBorderWrapper"] {
+  background: var(--nbs-panel); border: 1px solid var(--nbs-line) !important; border-radius: 18px !important;
+  backdrop-filter: blur(6px);
+}
+.stButton > button, .stDownloadButton > button, [data-testid="stFormSubmitButton"] > button {
+  border-radius: 12px; font-weight: 600; transition: transform .12s ease, filter .12s ease;
+}
+.stButton > button[kind="primary"], .stDownloadButton > button, [data-testid="stFormSubmitButton"] > button[kind="primaryFormSubmit"] {
+  background: linear-gradient(100deg, var(--nbs-lilac), var(--nbs-peach)); color: #1a1426; border: 0; font-weight: 700;
+}
+.stButton > button[kind="primary"]:hover, .stDownloadButton > button:hover { filter: brightness(1.07); transform: translateY(-1px); }
+[data-testid="stFileUploaderDropzone"] { background: rgba(184,164,255,.05); border: 1px dashed #4a3f6b; border-radius: 14px; }
+[data-testid="stMetric"] { background: rgba(255,255,255,.03); border: 1px solid var(--nbs-line); border-radius: 14px; padding: 10px 14px; }
+[data-testid="stExpander"] details { border-radius: 14px; border-color: var(--nbs-line); }
+.stTabs [data-baseweb="tab-list"] { gap: 2px; flex-wrap: wrap; }
+.stApp code { color: var(--nbs-peach); }
+
+.nbs-hero { position: relative; padding: 30px 28px 24px; margin: 4px 0 18px; border-radius: 22px;
+  border: 1px solid var(--nbs-line); overflow: hidden;
+  background: linear-gradient(135deg, rgba(184,164,255,.14), rgba(255,181,156,.07) 55%, rgba(13,11,20,0)); }
+.nbs-logo { font-family: 'Unbounded', sans-serif; font-weight: 700; font-size: clamp(34px, 7vw, 54px);
+  line-height: .95; letter-spacing: -.02em; color: var(--nbs-fg); }
+.nbs-logo span { display: block; margin-top: 10px; font-weight: 500; font-size: .36em; letter-spacing: .38em;
+  background: linear-gradient(90deg, var(--nbs-lilac), var(--nbs-peach)); -webkit-background-clip: text;
+  background-clip: text; color: transparent; }
+.nbs-hero p { color: var(--nbs-muted); margin: 16px 0 0; max-width: 46ch; font-size: 15px; line-height: 1.55; }
+.nbs-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 16px; }
+.nbs-tags b { font-weight: 600; font-size: 12px; padding: 4px 11px; border-radius: 999px;
+  border: 1px solid var(--nbs-line); color: var(--nbs-muted); background: rgba(255,255,255,.02); }
+.nbs-eq { position: absolute; right: 28px; top: 30px; display: flex; gap: 5px; align-items: flex-end; height: 62px; }
+.nbs-eq i { display: block; width: 6px; border-radius: 3px; height: 30%;
+  background: linear-gradient(180deg, var(--nbs-peach), var(--nbs-lilac)); animation: nbs-eq 1.25s ease-in-out infinite; }
+.nbs-eq i:nth-child(2) { animation-delay: -.2s } .nbs-eq i:nth-child(3) { animation-delay: -.55s }
+.nbs-eq i:nth-child(4) { animation-delay: -.9s } .nbs-eq i:nth-child(5) { animation-delay: -.35s }
+.nbs-eq i:nth-child(6) { animation-delay: -.7s } .nbs-eq i:nth-child(7) { animation-delay: -1.05s }
+@keyframes nbs-eq { 0%, 100% { height: 18%; } 50% { height: 100%; } }
+@media (prefers-reduced-motion: reduce) { .nbs-eq i { animation: none; height: 60%; } }
+@media (max-width: 560px) { .nbs-eq { display: none; } .nbs-hero { padding: 22px 18px 18px; } }
+.nbs-side-logo { font-family: 'Unbounded', sans-serif; font-weight: 700; font-size: 24px; line-height: 1; color: var(--nbs-fg); }
+.nbs-side-logo span { display: block; font-size: 10px; letter-spacing: .38em; margin-top: 6px; font-weight: 500; color: var(--nbs-lilac); }
+.nbs-step { font-family: 'Unbounded', sans-serif; font-size: 12px; letter-spacing: .14em; color: var(--nbs-lilac); text-transform: uppercase; }
+</style>
+"""
+
+
+def inject_design():
+    st.markdown(NBS_CSS, unsafe_allow_html=True)
+
+
+def render_hero(text="Ремиксы с новым битом, 20+ эффектов, музыка с нуля на нейросети, обложка и SEO для YouTube."):
+    st.markdown(f"""
+<div class="nbs-hero">
+  <div class="nbs-eq"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  <div class="nbs-logo">NBS<span>SOFT MUSIC</span></div>
+  <p>{text}</p>
+  <div class="nbs-tags"><b>Ремиксы</b><b>Новый бит</b><b>8D и 20+ эффектов</b><b>ИИ-генерация</b><b>Обложка и SEO</b></div>
+</div>""", unsafe_allow_html=True)
+
+
+def step_title(num, title):
+    st.markdown(f"<div class='nbs-step'>Шаг {num}</div>", unsafe_allow_html=True)
+    st.subheader(title)
+
+
 def render_auth():
-    st.title("🔐 Вход в AI Music Suite")
-    st.write("Войдите или зарегистрируйтесь, чтобы открыть студию ремиксов.")
+    render_hero("Войдите или зарегистрируйтесь, чтобы открыть студию.")
     tab_login, tab_reg = st.tabs(["🔑 Вход", "📝 Регистрация"])
 
     with tab_login:
@@ -1317,11 +1678,114 @@ def render_auth():
                     st.success("Готово! Теперь войдите во вкладке «Вход».")
 
 
+# =====================================================================
+# ПРОФИ ИИ-РЕМИКС: Stability AI · Stable Audio (audio-to-audio)
+# =====================================================================
+
+STABILITY_URL = "https://api.stability.ai/v2beta/audio/stable-audio-2/audio-to-audio"
+AI_MAX_SECONDS = 190
+AI_STYLE_PROMPTS = {
+    "lofi": "lo-fi hip hop remix, dusty boom bap drums with swing, warm Rhodes electric piano chords, "
+            "vinyl texture, soft deep sub bass",
+    "phonk": "drift phonk remix, aggressive distorted 808 bass, Memphis cowbell melody, hard trap drums, "
+             "dark atmosphere",
+    "trap": "melodic trap remix, booming 808 bass, crisp hi-hat rolls, punchy claps, airy bell melody, "
+            "atmospheric pads",
+    "house": "deep house remix, four on the floor kick, groovy offbeat bassline, organ chord stabs, "
+             "shimmering hi-hats, warm pads",
+    "synth": "synthwave remix, gated reverb snare, retro analog arpeggios, lush 80s pads, driving bassline",
+    "dance": "energetic sped up dance remix, punchy four on the floor drums, bright plucks, uplifting supersaw chords",
+}
+
+
+def get_stability_key():
+    """Ключ из Secrets (Streamlit Cloud → Settings → Secrets: STABILITY_API_KEY = "...") или из поля ввода."""
+    try:
+        return st.secrets.get("STABILITY_API_KEY", "")
+    except Exception:  # файла secrets нет — это нормально
+        return ""
+
+
+def build_ai_prompt(style, extra="", bpm=None, key_name=None):
+    parts = [f"Professional {AI_STYLE_PROMPTS[style]}"]
+    if bpm:
+        parts.append(f"{bpm:.0f} BPM")
+    if key_name:
+        parts.append(f"key of {key_name}")
+    parts.append("studio quality mix and master, high fidelity, wide stereo")
+    if extra.strip():
+        parts.append(extra.strip())
+    return ", ".join(parts)
+
+
+def stability_audio_to_audio(audio_bytes, filename, mime, prompt, strength, duration, api_key, model, seed):
+    data = {"prompt": prompt, "strength": f"{strength:.2f}", "duration": str(int(duration)),
+            "seed": str(int(seed)), "output_format": "mp3"}
+    if model:
+        data["model"] = model
+    resp = requests.post(STABILITY_URL,
+                         headers={"authorization": f"Bearer {api_key}", "accept": "audio/*"},
+                         files={"audio": (filename, audio_bytes, mime)}, data=data, timeout=600)
+    if resp.status_code == 200:
+        return resp.content
+    _raise_stability_error(resp)
+
+
+# --- Генерация трека с нуля (text-to-audio): своя музыка без загрузки чужого файла ---
+
+STABILITY_T2A_URL = "https://api.stability.ai/v2beta/audio/stable-audio-2/text-to-audio"
+GEN_MOODS = {
+    "Спокойный, мечтательный": "calm, dreamy, soft, emotional",
+    "Тёмный, ночной": "dark, nocturnal, moody, mysterious",
+    "Энергичный": "energetic, uplifting, driving",
+    "Грустный, ностальгия": "sad, melancholic, nostalgic",
+    "Агрессивный": "aggressive, hard-hitting, intense",
+    "Романтичный": "romantic, warm, intimate",
+}
+GEN_BPM = {"lofi": 80, "phonk": 130, "trap": 140, "house": 122, "synth": 105, "dance": 128}
+
+
+def build_gen_prompt(style, mood, bpm, extra=""):
+    core = AI_STYLE_PROMPTS[style].replace(" remix", "")
+    parts = [f"Original instrumental track, {core}", mood, f"{bpm} BPM",
+             "professional studio production, polished mix and master, high fidelity, wide stereo"]
+    if extra.strip():
+        parts.append(extra.strip())
+    return ", ".join(parts)
+
+
+def stability_text_to_audio(prompt, duration, api_key, model, seed):
+    data = {"prompt": prompt, "duration": str(int(duration)), "seed": str(int(seed)), "output_format": "mp3"}
+    if model:
+        data["model"] = model
+    resp = requests.post(STABILITY_T2A_URL,
+                         headers={"authorization": f"Bearer {api_key}", "accept": "audio/*"},
+                         files={"none": ""}, data=data, timeout=600)
+    if resp.status_code == 200:
+        return resp.content
+    _raise_stability_error(resp)
+
+
+def _raise_stability_error(resp):
+    try:
+        body = resp.json()
+        msg = "; ".join(body.get("errors") or []) or body.get("message") or body.get("name") or resp.text
+    except ValueError:
+        msg = resp.text[:300]
+    hints = {401: "проверьте API-ключ", 402: "на счёте Stability закончились кредиты",
+             403: "запрос отклонён модерацией Stability (например, загружен защищённый трек)",
+             413: "файл слишком большой", 429: "слишком много запросов, подождите минуту"}
+    hint = hints.get(resp.status_code, "")
+    raise RuntimeError(f"Stability AI ответил {resp.status_code}: {msg}" + (f" — {hint}" if hint else ""))
+
+
 def render_results(res):
-    st.success("🎉 Готово! Ремикс, обложка и SEO созданы.")
+    st.success("🎉 Готово! Трек, обложка и SEO созданы.")
     st.subheader("📥 Результаты")
     st.image(res["cover"], caption="Обложка для YouTube (1280×720)")
     st.audio(res["wav"], format="audio/wav")
+    if res.get("fx"):
+        st.markdown("**🎚️ Эффекты:** " + ", ".join(res["fx"]))
 
     beat = res.get("beat")
     if beat:
@@ -1337,6 +1801,16 @@ def render_results(res):
         if beat.get("drops"):
             st.caption(f"Дропов в аранжировке: {beat['drops']}")
         st.code(beat["pattern"], language="text")
+
+    if res.get("ai_mp3"):
+        st.markdown("**🤖 Профи ИИ-версия (Stable Audio)**")
+        st.audio(res["ai_mp3"], format="audio/mpeg")
+        st.download_button("🤖 Скачать ИИ-ремикс (MP3)", res["ai_mp3"], f"{res['slug']}_ai.mp3",
+                           "audio/mpeg", key="dl_ai")
+        with st.expander("Промпт, отправленный ИИ"):
+            st.code(res.get("ai_prompt", ""), language="text")
+    elif res.get("ai_error"):
+        st.warning(f"ИИ-версия не получилась. {res['ai_error']}")
 
     cols = st.columns(3 if res.get("mp3") else 2)
     cols[0].download_button("🖼️ Обложка (JPG)", res["cover"], f"{res['slug']}_cover.jpg",
@@ -1359,7 +1833,8 @@ def render_results(res):
 
 
 def main():
-    st.set_page_config(page_title="AI Music & Remix Studio", page_icon="🎛️", layout="centered")
+    st.set_page_config(page_title="NBS SOFT MUSIC", page_icon="🎧", layout="centered")
+    inject_design()
     init_db()
     st.session_state.setdefault("logged_in", False)
     st.session_state.setdefault("username", "")
@@ -1368,120 +1843,249 @@ def main():
         render_auth()
         st.stop()
 
-    st.sidebar.write(f"👤 Аккаунт: **{st.session_state['username']}**")
-    if st.sidebar.button("🚪 Выйти"):
-        for key in ("logged_in", "username", "result", "file_key", "beat_cache"):
-            st.session_state.pop(key, None)
-        st.rerun()
+    # --- Боковая панель: аккаунт и ключ нейросети ---
+    with st.sidebar:
+        st.markdown("<div class='nbs-side-logo'>NBS<span>SOFT MUSIC</span></div>", unsafe_allow_html=True)
+        st.write("")
+        st.write(f"👤 **{st.session_state['username']}**")
+        st.markdown("**🔑 Нейросеть Stability AI**")
+        api_key = get_stability_key()
+        if api_key:
+            st.caption("Ключ подключён через Secrets ✓")
+        else:
+            api_key = st.text_input("API-ключ", type="password", key="stab_key_input",
+                                    help="platform.stability.ai → API Keys. На Streamlit Cloud лучше сохранить "
+                                         "в Settings → Secrets как STABILITY_API_KEY.")
+        st.caption("Нужен для «Создать с нуля» и «Профи ИИ-ремикс». Одна генерация — 20 кредитов (≈ $0.20).")
+        if st.button("🚪 Выйти"):
+            for key in ("logged_in", "username", "result", "file_key", "beat_cache", "gen_track"):
+                st.session_state.pop(key, None)
+            st.rerun()
 
-    st.title("🎛️ AI Remix Studio & YouTube SEO")
-    st.write("Ремиксы ваших треков, обложка для YouTube и готовое английское SEO.")
+    render_hero()
 
-    uploaded = st.file_uploader("Загрузите трек (.mp3 или .wav)", type=["mp3", "wav"])
-    if uploaded is None:
-        st.info("Загрузите свой трек или трек, на который у вас есть права.")
+    # --- Шаг 1. Музыка ---
+    with st.container(border=True):
+        step_title(1, "🎵 Музыка")
+        mode = st.radio("Источник", ["upload", "generate"], horizontal=True, label_visibility="collapsed",
+                        format_func={"upload": "🎵 Загрузить свой трек",
+                                     "generate": "✨ Создать трек с нуля (ИИ)"}.get)
+        source_bytes, source_name, source_bpm = None, None, None
+        if mode == "upload":
+            uploaded = st.file_uploader("Загрузите трек (.mp3 или .wav)", type=["mp3", "wav"])
+            if uploaded is not None:
+                source_bytes, source_name = uploaded.getvalue(), uploaded.name
+            else:
+                st.caption("Загрузите свой трек или трек, на который у вас есть права.")
+        else:
+            gen_styles = {k: BEAT_STYLES[k]["name"] for k in AI_STYLE_PROMPTS}
+            c1, c2 = st.columns(2)
+            g_style = c1.selectbox("Стиль", list(gen_styles), format_func=gen_styles.get, key="gen_style")
+            g_mood = c2.selectbox("Настроение", list(GEN_MOODS), key="gen_mood")
+            c3, c4 = st.columns(2)
+            g_bpm = c3.slider("Темп, BPM", 60, 180, GEN_BPM[g_style], key=f"gen_bpm_{g_style}")
+            g_dur = c4.slider("Длительность, сек", 30, AI_MAX_SECONDS, 120, 10, key="gen_dur")
+            g_extra = st.text_input("Пожелания к звучанию (по-английски, необязательно)",
+                                    placeholder="soft female humming, rain sounds, acoustic guitar", key="gen_extra")
+            g_model = st.selectbox("Модель", ["stable-audio-2.5", "stable-audio-2"], key="gen_model")
+            g_prompt = build_gen_prompt(g_style, GEN_MOODS[g_mood], g_bpm, g_extra)
+            st.caption(f"Промпт для нейросети: {g_prompt}")
+            if st.button("✨ Сгенерировать трек · 20 кредитов ≈ $0.20", type="primary", key="gen_btn"):
+                if not api_key:
+                    st.error("Добавьте API-ключ Stability AI в боковой панели слева.")
+                else:
+                    with st.spinner("Нейросеть сочиняет трек, обычно это до минуты…"):
+                        try:
+                            seed = random.randint(1, 4_000_000)
+                            audio = stability_text_to_audio(g_prompt, g_dur, api_key, g_model, seed)
+                            st.session_state["gen_track"] = {"bytes": audio, "name": f"nbs_{g_style}_{seed}.mp3",
+                                                             "prompt": g_prompt, "bpm": g_bpm}
+                            st.session_state.pop("result", None)
+                        except Exception as err:
+                            st.error(str(err))
+            gen = st.session_state.get("gen_track")
+            if gen:
+                source_bytes, source_name, source_bpm = gen["bytes"], gen["name"], gen["bpm"]
+                st.success("Трек готов. Это ваша оригинальная музыка: дальше её можно обработать как обычно.")
+                st.download_button("⬇️ Скачать сгенерированный трек (MP3)", gen["bytes"], gen["name"],
+                                   "audio/mpeg", key="dl_gen")
+            else:
+                st.caption("Выберите стиль и настроение и нажмите «Сгенерировать».")
+        if source_bytes is not None:
+            st.audio(source_bytes)
+
+    if source_bytes is None:
         return
 
-    file_key = f"{uploaded.name}-{uploaded.size}"
+    file_key = f"{source_name}-{len(source_bytes)}-{hashlib.md5(source_bytes[:1_000_000]).hexdigest()[:10]}"
     if st.session_state.get("file_key") != file_key:
         st.session_state["file_key"] = file_key
         st.session_state.pop("result", None)
-    st.audio(uploaded)
 
-    # --- Релиз и обложка ---
-    st.subheader("🎨 Релиз и обложка")
-    genre_label = st.selectbox("🎵 Ниша / стиль", list(GENRES))
-    genre = GENRES[genre_label]
-    song_title = st.text_input("Название трека", "I WELCOME OCTOBER (Remix)")
-    artist_name = st.text_input("Артист", "Smagulov")
-    genre_text = st.text_input("Текст жанра на обложке", genre["short"], key=f"gtext_{genre_label}")
-    bg_file = st.file_uploader("Свой фон для обложки (необязательно)", type=["jpg", "jpeg", "png", "webp"])
+    # --- Шаг 2. Релиз и обложка ---
+    with st.container(border=True):
+        step_title(2, "🎨 Релиз и обложка")
+        genre_label = st.selectbox("Ниша / стиль канала", list(GENRES))
+        genre = GENRES[genre_label]
+        c1, c2 = st.columns(2)
+        song_title = c1.text_input("Название трека", "I WELCOME OCTOBER (Remix)")
+        artist_name = c2.text_input("Артист", "Smagulov")
+        genre_text = st.text_input("Текст жанра на обложке", genre["short"], key=f"gtext_{genre_label}")
+        bg_file = st.file_uploader("Свой фон для обложки (необязательно)", type=["jpg", "jpeg", "png", "webp"])
 
-    # --- Ремикс ---
-    st.subheader("🎛️ Ремикс")
-    preset_names = list(PRESETS)
-    preset_name = st.selectbox("Пресет", preset_names, index=preset_names.index(genre["preset"]),
-                               key=f"preset_{genre_label}")
-    p = PRESETS[preset_name]
-    k = f"{genre_label}_{preset_name}"  # ключи сбрасывают ползунки при смене пресета
+    # --- Шаг 3. Скорость и звучание ---
+    with st.container(border=True):
+        step_title(3, "🎛️ Скорость и звучание")
+        preset_names = list(PRESETS)
+        preset_name = st.selectbox("Пресет", preset_names, index=preset_names.index(genre["preset"]),
+                                   key=f"preset_{genre_label}")
+        p = PRESETS[preset_name]
+        k = f"{genre_label}_{preset_name}"  # ключи сбрасывают ползунки при смене пресета
+        with st.expander("Тонкая настройка", expanded=preset_name == "Свои настройки"):
+            link = st.checkbox("Эффект пластинки: тон меняется вместе со скоростью",
+                               value=p["link"], key=f"link_{k}")
+            if link:
+                speed = st.slider("Скорость", 0.70, 1.40, p["speed"], 0.01, key=f"speed_{k}")
+                tempo, pitch = 1.0, 0.0
+            else:
+                speed = 1.0
+                tempo = st.slider("Темп (без изменения тона)", 0.75, 1.30, p["tempo"], 0.01, key=f"tempo_{k}")
+                pitch = st.slider("Тональность, полутоны", -6.0, 6.0, p["pitch"], 0.5, key=f"pitch_{k}")
+            reverb = st.slider("Реверберация", 0.0, 1.0, p["reverb"], 0.05, key=f"reverb_{k}")
+            bass = st.slider("Усиление баса", 0.0, 1.0, p["bass"], 0.05, key=f"bass_{k}")
+            vinyl = st.slider("Винил (тепло, шипение, щелчки)", 0.0, 1.0, p["vinyl"], 0.05, key=f"vinyl_{k}")
+    settings = dict(link=link, speed=speed, tempo=tempo, pitch=pitch, reverb=reverb, bass=bass, vinyl=vinyl)
 
-    with st.expander("Тонкая настройка", expanded=preset_name == "Свои настройки"):
-        link = st.checkbox("Эффект пластинки: тон меняется вместе со скоростью",
-                           value=p["link"], key=f"link_{k}")
-        if link:
-            speed = st.slider("Скорость", 0.70, 1.40, p["speed"], 0.01, key=f"speed_{k}")
-            tempo, pitch = 1.0, 0.0
-        else:
-            speed = 1.0
-            tempo = st.slider("Темп (без изменения тона)", 0.75, 1.30, p["tempo"], 0.01, key=f"tempo_{k}")
-            pitch = st.slider("Тональность, полутоны", -6.0, 6.0, p["pitch"], 0.5, key=f"pitch_{k}")
-        reverb = st.slider("Реверберация", 0.0, 1.0, p["reverb"], 0.05, key=f"reverb_{k}")
-        bass = st.slider("Усиление баса", 0.0, 1.0, p["bass"], 0.05, key=f"bass_{k}")
-        vinyl = st.slider("Винил (тепло, шипение, щелчки)", 0.0, 1.0, p["vinyl"], 0.05, key=f"vinyl_{k}")
+    # --- Шаг 4. Новый бит и слои ---
+    with st.container(border=True):
+        step_title(4, "🥁 Новый бит и музыкальные слои")
+        beat_on = st.checkbox("Сделать новый бит", value=True,
+                              help="Определяет темп, сильные доли и басовые ноты трека и пишет под них свой ритм.")
+        style_labels = {"auto": f"Как у жанра — {BEAT_STYLES[genre['beat']]['name']}"}
+        style_labels.update({key: s["name"] for key, s in BEAT_STYLES.items()})
+        style_choice = st.selectbox("Стиль бита", list(style_labels), format_func=style_labels.get,
+                                    key=f"beatstyle_{genre_label}", disabled=not beat_on)
+        style_key = genre["beat"] if style_choice == "auto" else style_choice
+        bst = BEAT_STYLES[style_key]
+        kb = f"{genre_label}_{style_key}"
 
-    settings = dict(link=link, speed=speed, tempo=tempo, pitch=pitch,
-                    reverb=reverb, bass=bass, vinyl=vinyl)
+        has_demucs = demucs_available()
+        use_sep = st.checkbox("Вырезать старые барабаны нейросетью (Demucs)", value=has_demucs,
+                              disabled=not (beat_on and has_demucs),
+                              help="Делит трек на вокал, бас, барабаны и остальное; старые барабаны убираются полностью.")
+        if not has_demucs:
+            st.caption("Demucs не установлен: старый бит будет приглушён фильтром.")
 
-    # --- Новый бит ---
-    st.subheader("🥁 Новый бит")
-    beat_on = st.checkbox("Сделать новый бит", value=True,
-                          help="Определяет темп, сильные доли и басовые ноты трека и пишет под них свой ритм.")
-    style_labels = {"auto": f"Как у жанра — {BEAT_STYLES[genre['beat']]['name']}"}
-    style_labels.update({key: s["name"] for key, s in BEAT_STYLES.items()})
-    style_choice = st.selectbox("Стиль бита", list(style_labels), format_func=style_labels.get,
-                                key=f"beatstyle_{genre_label}", disabled=not beat_on)
-    style_key = genre["beat"] if style_choice == "auto" else style_choice
-    bst = BEAT_STYLES[style_key]
-    kb = f"{genre_label}_{style_key}"
+        st.session_state.setdefault("beat_seed", 1)
+        with st.expander("Настройки бита"):
+            beat_vol = st.slider("Громкость нового бита", 0.0, 1.5, 0.9, 0.05, key=f"bvol_{kb}")
+            beat_filter = st.slider("Приглушить старый бит (фильтр)", 0.0, 1.0, bst["filter"], 0.05,
+                                    key=f"bfilter_{kb}", disabled=use_sep,
+                                    help="Работает, когда Demucs выключен. Чем больше, тем ниже срез частот.")
+            beat_side = st.slider("Качание под бочку", 0.0, 1.0, bst["side"], 0.05, key=f"bside_{kb}")
+            beat_density = st.slider("Сложность и сбивки", 0.0, 1.0, 0.5, 0.05, key=f"bdens_{kb}")
+            beat_bass = st.checkbox("Новый бас (808 / саб) по нотам трека", value=True, key=f"bbass_{kb}")
+            tempo_choice = st.radio("Темп бита", ["Как найден", "½× (в 2 раза медленнее)", "2× (в 2 раза быстрее)"],
+                                    horizontal=True, help="Если бит спешит или тянется, переключите здесь.")
+            c1, c2 = st.columns([2, 1])
+            c1.number_input("Номер вариации бита", 1, 99999, key="beat_seed",
+                            help="Тот же номер даёт тот же бит, другой — новый ритм.")
+            c2.button("🎲 Другая", on_click=lambda: st.session_state.update(beat_seed=random.randint(1, 99999)))
+        beat_scale = {"Как найден": 1, "½× (в 2 раза медленнее)": 0.5}.get(tempo_choice, 2)
 
-    has_demucs = demucs_available()
-    use_sep = st.checkbox("Вырезать старые барабаны нейросетью (Demucs)", value=has_demucs,
-                          disabled=not (beat_on and has_demucs),
-                          help="Делит трек на вокал, бас, барабаны и остальное; старые барабаны убираются полностью.")
-    if not has_demucs:
-        st.caption("Demucs не установлен: старый бит будет приглушён фильтром. "
-                   "Чтобы вырезать барабаны полностью, выполните `pip install demucs` (вместе с PyTorch ~2 ГБ).")
+        lst = LAYER_STYLES[style_key]
+        keys_names = {"rhodes": "электропиано", "bell": "колокольчики", "organ": "хаус-орган",
+                      "arp": "арпеджио-синт", "pluck": "плак-синт"}
+        layers_on = st.checkbox("🎹 Добавить музыкальные слои по аккордам трека", value=True, disabled=not beat_on,
+                                help="Аккорды и мелодия строятся по гармонии трека, поэтому звучат в его тональности.")
+        with st.expander("Слои, переходы и сведение"):
+            layer_pad = st.slider("Аккорды (пэд)", 0.0, 1.0, lst["pad"], 0.05, key=f"lpad_{kb}")
+            layer_keys = st.slider(f"Клавиши: {keys_names[lst['keys_type']]}", 0.0, 1.0, lst["keys"], 0.05,
+                                   key=f"lkeys_{kb}")
+            layer_echo = st.slider("Эхо клавиш в темп", 0.0, 1.0, lst["echo"], 0.05, key=f"lecho_{kb}")
+            layer_fx = st.checkbox("Переходы: брейк, райзер, реверс-тарелка и удар на дропе", value=True, key=f"lfx_{kb}")
+            layer_polish = st.checkbox("Красивое сведение: склейка и широкое стерео", value=True, key=f"lpol_{kb}")
+        layers = dict(on=beat_on and layers_on, pad=layer_pad, keys=layer_keys, echo=layer_echo,
+                      fx=layer_fx, polish=layer_polish)
 
-    st.session_state.setdefault("beat_seed", 1)
-    with st.expander("Настройки бита"):
-        beat_vol = st.slider("Громкость нового бита", 0.0, 1.5, 0.9, 0.05, key=f"bvol_{kb}")
-        beat_filter = st.slider("Приглушить старый бит (фильтр)", 0.0, 1.0, bst["filter"], 0.05,
-                                key=f"bfilter_{kb}", disabled=use_sep,
-                                help="Работает, когда Demucs выключен. Чем больше, тем ниже срез частот.")
-        beat_side = st.slider("Качание под бочку", 0.0, 1.0, bst["side"], 0.05, key=f"bside_{kb}")
-        beat_density = st.slider("Сложность и сбивки", 0.0, 1.0, 0.5, 0.05, key=f"bdens_{kb}")
-        beat_bass = st.checkbox("Новый бас (808 / саб) по нотам трека", value=True, key=f"bbass_{kb}")
-        tempo_choice = st.radio("Темп бита", ["Как найден", "½× (в 2 раза медленнее)", "2× (в 2 раза быстрее)"],
-                                horizontal=True, help="Если бит спешит или тянется, переключите здесь.")
-        c1, c2 = st.columns([2, 1])
-        c1.number_input("Номер вариации бита", 1, 99999, key="beat_seed",
-                        help="Тот же номер даёт тот же бит, другой — новый ритм.")
-        c2.button("🎲 Другая", on_click=lambda: st.session_state.update(beat_seed=random.randint(1, 99999)))
-    beat_scale = {"Как найден": 1, "½× (в 2 раза медленнее)": 0.5}.get(tempo_choice, 2)
+    # --- Шаг 5. Эффекты ---
+    with st.container(border=True):
+        step_title(5, "🎚️ Эффекты")
+        fx_preset = st.selectbox("Набор эффектов", list(FX_PRESETS), key="fx_preset",
+                                 help="Готовый набор выставляет ползунки ниже; дальше их можно менять.")
+        base = {**FX_DEFAULTS, **FX_PRESETS[fx_preset]}
+        kf = f"fx_{fx_preset}_"
+        fx = {}
+        t1, t2, t3, t4, t5 = st.tabs(["Тембр", "Окраска", "Движение", "Пространство", "Ритм и финал"])
+        with t1:
+            c1, c2, c3 = st.columns(3)
+            fx["eq_low"] = c1.slider("Низы, дБ", -12.0, 12.0, float(base["eq_low"]), .5, key=kf + "eq_low")
+            fx["eq_mid"] = c2.slider("Середина, дБ", -12.0, 12.0, float(base["eq_mid"]), .5, key=kf + "eq_mid")
+            fx["eq_high"] = c3.slider("Верха, дБ", -12.0, 12.0, float(base["eq_high"]), .5, key=kf + "eq_high")
+            fx["hp"] = st.slider("Срез низов, Гц (20 — выключен)", 20, 1000, int(base["hp"]), 10, key=kf + "hp")
+            fx["lp"] = st.slider("Срез верхов, Гц (20000 — выключен)", 500, 20000, int(base["lp"]), 100, key=kf + "lp",
+                                 help="Низкие значения дают эффект «из-за стены» или «под водой».")
+        with t2:
+            fx["saturation"] = st.slider("Ламповая теплота (сатурация)", 0.0, 1.0, float(base["saturation"]), .05, key=kf + "sat")
+            fx["distortion"] = st.slider("Дисторшн", 0.0, 1.0, float(base["distortion"]), .05, key=kf + "dist")
+            fx["bitcrush"] = st.slider("Биткраш (звук ретро-приставки)", 0.0, 1.0, float(base["bitcrush"]), .05, key=kf + "bit")
+            fx["radio"] = st.slider("Старое радио / телефон", 0.0, 1.0, float(base["radio"]), .05, key=kf + "radio")
+        with t3:
+            fx["chorus"] = st.slider("Хорус (объём, «плывущий» звук)", 0.0, 1.0, float(base["chorus"]), .05, key=kf + "chorus")
+            fx["flanger"] = st.slider("Фленжер (реактивный «вжух»)", 0.0, 1.0, float(base["flanger"]), .05, key=kf + "flanger")
+            fx["phaser"] = st.slider("Фэйзер (вращение)", 0.0, 1.0, float(base["phaser"]), .05, key=kf + "phaser")
+            fx["autofilter"] = st.slider("Свип-фильтр в темп", 0.0, 1.0, float(base["autofilter"]), .05, key=kf + "af")
+            fx["tremolo"] = st.slider("Тремоло (пульсация громкости)", 0.0, 1.0, float(base["tremolo"]), .05, key=kf + "trem")
+        with t4:
+            fx["eight_d"] = st.slider("8D Audio (звук вокруг головы, слушать в наушниках)", 0.0, 1.0,
+                                      float(base["eight_d"]), .05, key=kf + "8d")
+            fx["autopan"] = st.slider("Автопанорама (лево–право в темп)", 0.0, 1.0, float(base["autopan"]), .05, key=kf + "pan")
+            fx["width"] = st.slider("Ширина стерео (1 — как есть, 0 — моно)", 0.0, 2.0, float(base["width"]), .05, key=kf + "width")
+            fx["room"] = st.slider("Зал (дополнительная реверберация)", 0.0, 1.0, float(base["room"]), .05, key=kf + "room")
+            fx["echo"] = st.slider("Эхо в темп", 0.0, 1.0, float(base["echo"]), .05, key=kf + "echo")
+            c1, c2 = st.columns(2)
+            echo_opts = {0.25: "1/16", 0.5: "1/8", 0.75: "пунктирная 1/8", 1.0: "1/4"}
+            fx["echo_beats"] = c1.selectbox("Шаг эха", list(echo_opts), format_func=echo_opts.get,
+                                            index=list(echo_opts).index(base["echo_beats"]), key=kf + "eb")
+            fx["echo_fb"] = c2.slider("Повторы эха", 0.1, 0.8, float(base["echo_fb"]), .05, key=kf + "efb")
+        with t5:
+            fx["gate"] = st.slider("Транс-гейт (рубленый ритм 1/16)", 0.0, 1.0, float(base["gate"]), .05, key=kf + "gate")
+            fx["comp"] = st.slider("Компрессор (плотнее и громче)", 0.0, 1.0, float(base["comp"]), .05, key=kf + "comp")
+            fx["tapestop"] = st.slider("Тейп-стоп в конце (плёнка останавливается)", 0.0, 1.0,
+                                       float(base["tapestop"]), .05, key=kf + "tape")
+        chosen = active_fx(fx)
+        st.caption("Включено: " + (", ".join(chosen) if chosen else "ничего"))
 
-    lst = LAYER_STYLES[style_key]
-    keys_names = {"rhodes": "электропиано", "bell": "колокольчики", "organ": "хаус-орган",
-                  "arp": "арпеджио-синт", "pluck": "плак-синт"}
-    layers_on = st.checkbox("🎹 Добавить музыкальные слои по аккордам трека", value=True, disabled=not beat_on,
-                            help="Аккорды и мелодия строятся по басовым нотам и гармонии трека, поэтому звучат в его тональности.")
-    with st.expander("Слои, переходы и сведение"):
-        layer_pad = st.slider("Аккорды (пэд)", 0.0, 1.0, lst["pad"], 0.05, key=f"lpad_{kb}")
-        layer_keys = st.slider(f"Клавиши: {keys_names[lst['keys_type']]}", 0.0, 1.0, lst["keys"], 0.05, key=f"lkeys_{kb}")
-        layer_echo = st.slider("Эхо в темп", 0.0, 1.0, lst["echo"], 0.05, key=f"lecho_{kb}")
-        layer_fx = st.checkbox("Переходы: брейк, райзер, реверс-тарелка и удар на дропе", value=True, key=f"lfx_{kb}")
-        layer_polish = st.checkbox("Красивое сведение: склейка и широкое стерео", value=True, key=f"lpol_{kb}")
-    layers = dict(on=beat_on and layers_on, pad=layer_pad, keys=layer_keys, echo=layer_echo,
-                  fx=layer_fx, polish=layer_polish)
+    # --- Шаг 6. Профи ИИ-ремикс ---
+    with st.container(border=True):
+        step_title(6, "🤖 Профи ИИ-ремикс")
+        ai_on = st.checkbox("Перегенерировать нейросетью Stable Audio", value=False,
+                            help="Нейросеть берёт трек как основу и заново исполняет его в выбранном стиле: "
+                                 "живее и «дороже» по звуку. 20 кредитов Stability (≈ $0.20) за генерацию.")
+        ai_source, ai_strength, ai_extra, ai_model = "remix", 0.75, "", "stable-audio-2.5"
+        if ai_on:
+            if not api_key:
+                st.warning("Добавьте API-ключ Stability AI в боковой панели слева.")
+            ai_source = st.radio("Что отправить нейросети", ["remix", "original"], horizontal=True,
+                                 format_func={"remix": "Готовый трек со всеми эффектами (рекомендуется)",
+                                              "original": "Исходный трек"}.get)
+            ai_strength = st.slider("Насколько сильно переделать", 0.5, 0.95, 0.75, 0.05,
+                                    help="0.6–0.7 — близко к оригиналу; 0.8–0.9 — смелее, больше нового.")
+            ai_extra = st.text_input("Пожелания к звучанию (по-английски, необязательно)",
+                                     placeholder="female vocal chops, rainy night mood, more reverb")
+            ai_model = st.selectbox("Модель", ["stable-audio-2.5", "stable-audio-2"], key="ai_model")
+            st.caption(f"Нейросеть обрабатывает до {AI_MAX_SECONDS // 60} мин {AI_MAX_SECONDS % 60} с трека. "
+                       "Загружайте только свои треки или треки с лицензией: Stability проверяет загрузки.")
 
-    if st.button("🚀 Создать ремикс, обложку и SEO", type="primary"):
+    if st.button("🚀 Создать трек, обложку и SEO", type="primary", use_container_width=True):
         if not song_title.strip():
             st.warning("Введите название трека.")
             st.stop()
 
-        suffix = Path(uploaded.name).suffix.lower() or ".mp3"
+        suffix = Path(source_name).suffix.lower() or ".mp3"
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         try:
-            tmp.write(uploaded.getvalue())
+            tmp.write(source_bytes)
             tmp.close()
 
             with st.status("Обработка…", expanded=True) as status:
@@ -1491,6 +2095,7 @@ def main():
                     st.error(f"Трек длиннее {MAX_TRACK_MINUTES} минут.")
                     st.stop()
                 y, sr = load_audio(tmp.name)
+                y_original = y
 
                 beat_info = None
                 if beat_on:
@@ -1505,7 +2110,7 @@ def main():
                                 stems = separate(y, sr, get_demucs_model())
                             except Exception as err:
                                 st.warning(f"Demucs не сработал ({err}). Приглушаю старый бит фильтром.")
-                        st.write("📈 Ищем темп, сильные доли и басовые ноты…")
+                        st.write("📈 Ищем темп, сильные доли, басовые ноты и аккорды…")
                         analysis = analyze(y, sr, drums=stems["drums"] if stems else None,
                                            bass=stems["bass"] if stems else None,
                                            harm=stems["other"] if stems else None)
@@ -1520,13 +2125,48 @@ def main():
                         layers=layers)
                     beat_info["bpm_out"] = beat_info["bpm"] * (speed if link else tempo)
 
-                st.write("🎚️ Применяем эффекты…")
-                y = process_audio(y, sr, settings)
+                # Темп для эффектов «в темп» (эхо, гейт, тремоло, свип, автопанорама)
+                fx_bpm = beat_info["bpm_out"] if beat_info else None
+                if fx_bpm is None and any(fx.get(name, 0) > 0 for name in SYNCED_FX):
+                    base_bpm = source_bpm or float(np.atleast_1d(librosa.beat.beat_track(y=y.mean(0), sr=sr)[0])[0])
+                    fx_bpm = (base_bpm or 120.0) * (speed if link else tempo)
+
+                st.write("🎚️ Применяем эффекты и мастеринг…")
+                y = process_audio(y, sr, settings, fx, fx_bpm or 120.0)
                 wav = encode_audio(y, sr, "WAV")
                 try:
                     mp3 = encode_audio(y, sr, "MP3")
                 except Exception:  # старая libsndfile без MP3 — отдаём только WAV
                     mp3 = None
+
+                ai_mp3, ai_error, ai_prompt = None, None, ""
+                if ai_on:
+                    if not api_key:
+                        ai_error = "Не указан API-ключ Stability AI (боковая панель слева)."
+                    else:
+                        st.write("🤖 Нейросеть Stable Audio перегенерирует трек (обычно до минуты)…")
+                        src = y if ai_source == "remix" else y_original
+                        src = src[:, :int(AI_MAX_SECONDS * sr)]
+                        try:
+                            payload, fname, mime = encode_audio(src, sr, "MP3"), "track.mp3", "audio/mpeg"
+                        except Exception:
+                            payload, fname, mime = encode_audio(src, sr, "WAV"), "track.wav", "audio/wav"
+                        key_name = None
+                        if beat_info and st.session_state.get("beat_cache"):
+                            an = st.session_state["beat_cache"]["analysis"]
+                            same = an["roots"] == an["key"]
+                            minor_arr = an.get("minor")
+                            is_minor = bool(minor_arr[same].mean() > .5) if minor_arr is not None and same.any() else False
+                            key_name = NOTE_NAMES[an["key"]] + (" minor" if is_minor else " major")
+                        bpm_out = fx_bpm if ai_source == "remix" else (beat_info["bpm"] if beat_info else source_bpm)
+                        ai_prompt = build_ai_prompt(style_key, ai_extra, bpm_out, key_name)
+                        try:
+                            ai_mp3 = stability_audio_to_audio(
+                                payload, fname, mime, ai_prompt, ai_strength,
+                                min(AI_MAX_SECONDS, src.shape[1] / sr), api_key, ai_model,
+                                int(st.session_state.get("beat_seed", 1)))
+                        except Exception as err:
+                            ai_error = str(err)
 
                 st.write("🎨 Рисуем обложку…")
                 background = None
@@ -1554,10 +2194,12 @@ def main():
         st.session_state["result"] = dict(
             wav=wav, mp3=mp3, cover=cover, titles=titles, description=description,
             tags=tags, slug=slugify(f"{artist_name}_{song_title}"), beat=beat_info,
+            ai_mp3=ai_mp3, ai_error=ai_error, ai_prompt=ai_prompt, fx=active_fx(fx),
         )
 
     if "result" in st.session_state:
-        render_results(st.session_state["result"])
+        with st.container(border=True):
+            render_results(st.session_state["result"])
 
 
 if __name__ == "__main__":
