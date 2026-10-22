@@ -28,7 +28,13 @@ from scipy.signal import butter, lfilter, oaconvolve, sosfilt
 # НАСТРОЙКИ
 # =====================================================================
 
-DB_PATH = Path(__file__).resolve().with_name("users.db")
+# На своём сервере база лежит в постоянной папке NBS_DATA_DIR (её не стирают перезапуски и обновления)
+DATA_DIR = Path(os.environ.get("NBS_DATA_DIR") or Path(__file__).resolve().parent)
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:  # нет прав на папку — работаем из папки приложения
+    DATA_DIR = Path(__file__).resolve().parent
+DB_PATH = DATA_DIR / "users.db"
 PBKDF2_ITERATIONS = 200_000
 MAX_TRACK_MINUTES = 15
 COVER_SIZE = (1280, 720)
@@ -1700,6 +1706,8 @@ AI_STYLE_PROMPTS = {
 
 def get_stability_key():
     """Ключ из Secrets (Streamlit Cloud → Settings → Secrets: STABILITY_API_KEY = "...") или из поля ввода."""
+    if os.environ.get("STABILITY_API_KEY"):        # свой сервер: ключ из файла .env
+        return os.environ["STABILITY_API_KEY"]
     try:
         return st.secrets.get("STABILITY_API_KEY", "")
     except Exception:  # файла secrets нет — это нормально
