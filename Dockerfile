@@ -1,8 +1,9 @@
 FROM python:3.11-slim
 
-# ffmpeg и libsndfile — чтение/запись MP3 и WAV; dejavu — шрифт с кириллицей для обложек
+# ffmpeg — MP3 320 и видео; libsndfile — WAV; rubberband — студийная смена темпа и тона;
+# dejavu — шрифт с кириллицей для обложек
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg libsndfile1 fonts-dejavu-core \
+ && apt-get install -y --no-install-recommends ffmpeg libsndfile1 rubberband-cli fonts-dejavu-core \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

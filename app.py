@@ -21,7 +21,10 @@ import requests
 import soundfile as sf
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
-from scipy.signal import butter, lfilter, oaconvolve, sosfilt
+import shutil
+import subprocess
+
+from scipy.signal import butter, lfilter, oaconvolve, resample_poly, sosfilt
 
 
 # =====================================================================
@@ -104,6 +107,79 @@ def init_db():
                    is_active INTEGER DEFAULT 1
                )"""
         )
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+        if "ai_credits" not in cols:      # обновление старой базы без потери пользователей
+            conn.execute("ALTER TABLE users ADD COLUMN ai_credits INTEGER DEFAULT 0")
+        if "created_at" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
+        conn.execute("""CREATE TABLE IF NOT EXISTS credit_log (
+                            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                            username TEXT, delta INTEGER, reason TEXT,
+                            ts       TEXT DEFAULT (datetime('now'))
+                        )""")
+
+
+def get_setting(name, default=""):
+    """Настройка из переменных окружения (Render, свой сервер) или из Secrets (Streamlit Cloud)."""
+    if os.environ.get(name):
+        return os.environ[name]
+    try:
+        return str(st.secrets.get(name, default))
+    except Exception:
+        return default
+
+
+def is_admin(username):
+    admins = {u.strip().lower() for u in get_setting("ADMIN_USERS").split(",") if u.strip()}
+    return username.strip().lower() in admins
+
+
+def get_user(username):
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT username, is_active, ai_credits, created_at FROM users WHERE username = ?",
+                           (username,)).fetchone()
+    return None if row is None else dict(zip(("username", "is_active", "ai_credits", "created_at"), row))
+
+
+def list_users():
+    with closing(get_conn()) as conn:
+        rows = conn.execute("SELECT username, is_active, ai_credits, created_at FROM users "
+                            "ORDER BY created_at DESC, username").fetchall()
+    return [dict(zip(("username", "is_active", "ai_credits", "created_at"), r)) for r in rows]
+
+
+def add_credits(username, delta, reason=""):
+    with closing(get_conn()) as conn, conn:
+        conn.execute("UPDATE users SET ai_credits = MAX(0, COALESCE(ai_credits, 0) + ?) WHERE username = ?",
+                     (int(delta), username))
+        conn.execute("INSERT INTO credit_log (username, delta, reason) VALUES (?, ?, ?)",
+                     (username, int(delta), reason))
+
+
+def spend_credit(username, reason):
+    """Атомарно списывает 1 генерацию. False — если баланс пуст."""
+    with closing(get_conn()) as conn, conn:
+        cur = conn.execute("UPDATE users SET ai_credits = ai_credits - 1 WHERE username = ? AND ai_credits > 0",
+                           (username,))
+        if cur.rowcount:
+            conn.execute("INSERT INTO credit_log (username, delta, reason) VALUES (?, -1, ?)", (username, reason))
+        return cur.rowcount == 1
+
+
+def set_active(username, active):
+    with closing(get_conn()) as conn, conn:
+        conn.execute("UPDATE users SET is_active = ? WHERE username = ?", (1 if active else 0, username))
+
+
+def set_password(username, password):
+    with closing(get_conn()) as conn, conn:
+        conn.execute("UPDATE users SET password = ? WHERE username = ?", (hash_password(password), username))
+
+
+def credit_history(username, limit=20):
+    with closing(get_conn()) as conn:
+        return conn.execute("SELECT ts, delta, reason FROM credit_log WHERE username = ? ORDER BY id DESC LIMIT ?",
+                            (username, limit)).fetchall()
 
 
 def hash_password(password, salt=None, iterations=PBKDF2_ITERATIONS):
@@ -135,7 +211,7 @@ def register_user(username, password):
         return "Пароль должен быть не короче 6 символов."
     try:
         with closing(get_conn()) as conn, conn:
-            conn.execute("INSERT INTO users (username, password) VALUES (?, ?)",
+            conn.execute("INSERT INTO users (username, password, created_at) VALUES (?, ?, datetime('now'))",
                          (username, hash_password(password)))
     except sqlite3.IntegrityError:
         return "Такой логин уже занят."
@@ -192,7 +268,32 @@ def change_speed(y, sr, factor):
     return librosa.resample(y, orig_sr=sr, target_sr=int(round(sr / factor)), axis=-1)
 
 
+def rubberband_available():
+    return shutil.which("rubberband") is not None
+
+
+def _rubberband(y, sr, pitch, tempo):
+    """Студийная смена темпа/тона через Rubber Band (движок R3): чище, без «фазового» призвука."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = os.path.join(tmp, "in.wav"), os.path.join(tmp, "out.wav")
+        sf.write(src, y.T, sr, subtype="FLOAT")
+        base = ["rubberband", "-q", "-T", f"{tempo:.6f}", "-p", f"{pitch:.4f}"]
+        for engine in (["--fine"], []):            # R3, если версия умеет; иначе стандартный движок
+            res = subprocess.run(base + engine + [src, dst], capture_output=True, timeout=900)
+            if res.returncode == 0 and os.path.exists(dst):
+                out, _ = sf.read(dst, dtype="float32", always_2d=True)
+                return out.T
+        raise RuntimeError(res.stderr.decode(errors="ignore")[:300])
+
+
 def shift_pitch_and_tempo(y, sr, pitch, tempo):
+    if not pitch and abs(tempo - 1.0) <= 1e-3:
+        return y
+    if rubberband_available():
+        try:
+            return _rubberband(y, sr, pitch, tempo)
+        except Exception:
+            pass                                    # запасной путь — librosa
     if pitch:
         y = librosa.effects.pitch_shift(y, sr=sr, n_steps=pitch)
     if abs(tempo - 1.0) > 1e-3:
@@ -534,7 +635,133 @@ def apply_space(y, sr, fx, bpm):
     return y
 
 
-def process_audio(y, sr, s, fx=None, bpm=120.0):
+# =====================================================================
+# МАСТЕРИНГ: громкость по стандарту LUFS (ITU-R BS.1770), true-peak лимитер, моно-низ, склейка
+# =====================================================================
+
+MASTER_TARGETS = {
+    "youtube": {"name": "YouTube / Spotify / Apple Music (−14 LUFS)", "lufs": -14.0, "ceiling": -1.0},
+    "social": {"name": "TikTok / Reels / Shorts, громче (−11 LUFS)", "lufs": -11.0, "ceiling": -1.0},
+    "loud": {"name": "Максимально громко, клубный (−9 LUFS)", "lufs": -9.0, "ceiling": -0.8},
+    "soft": {"name": "Мягко, больше динамики (−16 LUFS)", "lufs": -16.0, "ceiling": -1.5},
+}
+MASTER_DEFAULTS = dict(on=True, target="youtube", mono_bass=True, glue=0.3, air=0.0, warmth=0.0)
+
+
+def _k_weight(y, sr):
+    """K-фильтр BS.1770: полка +4 дБ на верхах и срез ниже ~38 Гц."""
+    y = sosfilt(_rbj("highshelf", 1500.0, sr, 4.0, q=0.7071), y, axis=-1)
+    w = 2 * np.pi * 38.0 / sr
+    cw, alpha = np.cos(w), np.sin(w) / (2 * 0.5)
+    b = np.array([(1 + cw) / 2, -(1 + cw), (1 + cw) / 2]) / (1 + alpha)
+    a = np.array([1, -2 * cw / (1 + alpha), (1 - alpha) / (1 + alpha)])
+    return lfilter(b, a, y, axis=-1)
+
+
+def integrated_lufs(y, sr):
+    """Интегральная громкость в LUFS с абсолютным (−70) и относительным (−10 LU) гейтами."""
+    if y.ndim == 1:
+        y = y[None, :]
+    k = _k_weight(y.astype(np.float64), sr)
+    block, step = int(.4 * sr), int(.1 * sr)
+    if k.shape[1] < block:
+        return -70.0
+    csum = np.concatenate([np.zeros((k.shape[0], 1)), np.cumsum(k ** 2, axis=1)], axis=1)
+    starts = np.arange(0, k.shape[1] - block + 1, step)
+    ms = ((csum[:, starts + block] - csum[:, starts]) / block).sum(0)
+    lk = -0.691 + 10 * np.log10(ms + 1e-12)
+    gated = ms[lk > -70]
+    if not len(gated):
+        return -70.0
+    rel = -0.691 + 10 * np.log10(gated.mean()) - 10
+    gated = ms[(lk > -70) & (lk > rel)]
+    return float(-0.691 + 10 * np.log10(gated.mean() + 1e-12)) if len(gated) else -70.0
+
+
+def true_peak_db(y):
+    """Истинный пик (с учётом межвыборочных пиков) через 4-кратную передискретизацию."""
+    up = resample_poly(y, 4, 1, axis=-1)
+    return float(20 * np.log10(np.max(np.abs(up)) + 1e-12))
+
+
+def limiter(y, sr, ceiling_db=-1.0, release_ms=80.0, block=64):
+    """Лимитер с упреждением: заранее плавно убирает громкость перед пиком — без щелчков и клиппинга."""
+    ceiling = 10 ** (ceiling_db / 20)
+    n = y.shape[1]
+    nb = -(-n // block)
+    pad = nb * block - n
+    # пики по каждому блоку на 4× передискретизированном сигнале (ловит межвыборочные пики)
+    up = np.abs(resample_poly(y, 4, 1, axis=-1)).max(0)
+    up = np.pad(up, (0, max(0, nb * block * 4 - len(up))))[:nb * block * 4]
+    peaks = up.reshape(nb, block * 4).max(1)
+    req = np.minimum(1.0, ceiling / (peaks + 1e-12))
+    # упреждение: блок «видит» по два соседних блока с каждой стороны
+    padded = np.pad(req, 2, constant_values=1.0)
+    g = np.min(np.stack([padded[i:i + nb] for i in range(5)]), axis=0)
+    # плавное восстановление (release) в децибелах
+    g_db = 20 * np.log10(g)
+    step = 20 * np.log10(2) / max(1.0, release_ms / 1000 * sr / block)   # +6 дБ за release_ms
+    out = np.empty(nb)
+    cur = 0.0
+    for i in range(nb):
+        cur = min(g_db[i], cur + step)
+        out[i] = cur
+    centers = np.arange(nb) * block + block / 2
+    gain = 10 ** (np.interp(np.arange(n + pad), centers, out) / 20)[:n]
+    return y * gain
+
+
+def glue_compressor(y, sr, amount):
+    """Мягкая шинная компрессия 2:1 — собирает бит, бас и вокал в один плотный звук."""
+    if amount <= 0:
+        return y
+    rms = np.sqrt(_one_pole(np.mean(y ** 2, axis=0), sr, .03) + 1e-12)
+    lvl = 20 * np.log10(rms)
+    loud = lvl[lvl > np.percentile(lvl, 30)]
+    thr = (np.percentile(loud, 85) if len(loud) else lvl.max()) - 2 - 6 * amount
+    ratio = 1.5 + 2.0 * amount
+    over = np.maximum(0, lvl - thr)
+    gr = _one_pole(over * (1 - 1 / ratio), sr, .12)   # плавная огибающая: без «насоса»
+    return y * 10 ** (-gr / 20)
+
+
+def mono_bass(y, sr, freq=120.0):
+    """Бас ниже 120 Гц — в центр: плотнее и громче на телефонах и в клубе."""
+    mid, side = (y[0] + y[1]) / 2, (y[0] - y[1]) / 2
+    side = highpass(side, sr, freq, order=4)
+    return np.stack([mid + side, mid - side])
+
+
+def master_audio(y, sr, opts=None):
+    """Мастеринг-цепочка. Возвращает (сигнал, отчёт о громкости)."""
+    o = {**MASTER_DEFAULTS, **(opts or {})}
+    tgt = MASTER_TARGETS[o["target"]]
+    report = {"lufs_in": integrated_lufs(y, sr), "tp_in": true_peak_db(y)}
+    y = highpass(y, sr, 22, order=2)                         # убираем инфразвук и постоянную составляющую
+    if y.shape[0] == 2 and o["mono_bass"]:
+        y = mono_bass(y, sr)
+    if o["warmth"] > 0:                                      # тёплая середина-низ
+        y = sosfilt(_rbj("peak", 220, sr, 2.5 * o["warmth"], q=.7), y, axis=-1)
+    if o["air"] > 0:                                         # «воздух» на верхах
+        y = sosfilt(_rbj("highshelf", 11000, sr, 3.5 * o["air"]), y, axis=-1)
+    y = glue_compressor(y, sr, o["glue"])
+    for _ in range(4):                                       # громкость → лимитер → проверка
+        cur = integrated_lufs(y, sr)
+        if cur <= -69:
+            break
+        diff = tgt["lufs"] - cur
+        if abs(diff) < .15:
+            break
+        y = limiter(y * 10 ** (diff / 20), sr, tgt["ceiling"])
+    tp = true_peak_db(y)
+    if tp > tgt["ceiling"]:                                  # страховка от остаточных пиков
+        y = y * 10 ** ((tgt["ceiling"] - tp - .05) / 20)
+    report.update(lufs_out=integrated_lufs(y, sr), tp_out=true_peak_db(y), target=tgt["name"])
+    return y, report
+
+
+def process_audio(y, sr, s, fx=None, bpm=120.0, master=None, fades=(0.02, 0.05)):
+    """Скорость/тон → эффекты → пространство → винил → мастеринг. Возвращает (сигнал, отчёт)."""
     if y.shape[0] == 1:
         y = np.repeat(y, 2, axis=0)
     if s["link"]:
@@ -550,8 +777,14 @@ def process_audio(y, sr, s, fx=None, bpm=120.0):
     y = apply_reverb(y, sr, s["reverb"])
     y = normalize(y, -3.0)
     y = apply_vinyl(y, sr, s["vinyl"])
-    y = normalize(y, -1.0)
-    return apply_fades(y, sr).astype(np.float32)
+    m = {**MASTER_DEFAULTS, **(master or {})}
+    report = None
+    if m["on"]:
+        y, report = master_audio(y, sr, m)
+    else:
+        y = normalize(y, -1.0)
+    y = apply_fades(y, sr, *fades)
+    return y.astype(np.float32), report
 
 
 @st.cache_resource(show_spinner=False)
@@ -560,13 +793,74 @@ def get_demucs_model():
     return load_demucs_model()
 
 
-def encode_audio(y, sr, fmt):
+def _tpdf_dither(y, bits):
+    """Треугольный дизеринг перед округлением до 16 бит — убирает «цифровой» призвук на тихих местах."""
+    rng = np.random.default_rng(0)
+    lsb = 1.0 / (2 ** (bits - 1))
+    return y + (rng.random(y.shape) - rng.random(y.shape)) * lsb
+
+
+def _ffmpeg_mp3(y, sr):
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = os.path.join(tmp, "in.wav"), os.path.join(tmp, "out.mp3")
+        sf.write(src, y.T, sr, subtype="FLOAT")
+        ar = ["-ar", "48000"] if sr > 48000 else []
+        res = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, *ar,
+                              "-c:a", "libmp3lame", "-b:a", "320k", dst], capture_output=True, timeout=600)
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.decode(errors="ignore")[:300])
+        with open(dst, "rb") as fh:
+            return fh.read()
+
+
+def encode_audio(y, sr, fmt, bits=16):
+    """WAV 16/24 бит или MP3 320 кбит/с."""
+    y = np.clip(y, -1.0, 1.0)
     buf = io.BytesIO()
     if fmt == "WAV":
-        sf.write(buf, y.T, sr, format="WAV", subtype="PCM_16")
-    else:
+        if bits == 24:
+            sf.write(buf, y.T, sr, format="WAV", subtype="PCM_24")
+        else:
+            sf.write(buf, np.clip(_tpdf_dither(y, 16), -1, 1).T, sr, format="WAV", subtype="PCM_16")
+        return buf.getvalue()
+    if shutil.which("ffmpeg"):
+        try:
+            return _ffmpeg_mp3(y, sr)
+        except Exception:
+            pass
+    try:   # максимальное качество MP3 в libsndfile (soundfile ≥ 0.13)
+        sf.write(buf, y.T, sr, format="MP3", compression_level=0.0, bitrate_mode="CONSTANT")
+    except TypeError:
         sf.write(buf, y.T, sr, format="MP3")
     return buf.getvalue()
+
+
+def make_video(cover_jpg, wav_bytes, accent, size=(1920, 1080)):
+    """MP4 для YouTube: обложка + анимированная волна звука в цвет жанра. Нужен ffmpeg."""
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("на сервере нет ffmpeg")
+    w, h = size
+    color = "0x%02X%02X%02X" % tuple(accent)
+    with tempfile.TemporaryDirectory() as tmp:
+        img, aud, out = (os.path.join(tmp, x) for x in ("cover.jpg", "audio.wav", "video.mp4"))
+        with open(img, "wb") as fh:
+            fh.write(cover_jpg)
+        with open(aud, "wb") as fh:
+            fh.write(wav_bytes)
+        wave_h = h // 6
+        graph = (f"[0:v]scale={w}:{h}:flags=lanczos,format=rgba[bg];"
+                 f"[1:a]aformat=channel_layouts=mono,showwaves=s={w}x{wave_h}:mode=cline:rate=25:"
+                 f"colors={color}@0.92:scale=sqrt:draw=full,format=rgba[wv];"
+                 f"[bg][wv]overlay=0:H-h-{h // 18}:format=auto,format=yuv420p[v]")
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-framerate", "25", "-i", img, "-i", aud,
+               "-filter_complex", graph, "-map", "[v]", "-map", "1:a",
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-r", "25",
+               "-c:a", "aac", "-b:a", "320k", "-shortest", "-movflags", "+faststart", out]
+        res = subprocess.run(cmd, capture_output=True, timeout=1800)
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.decode(errors="ignore")[-400:])
+        with open(out, "rb") as fh:
+            return fh.read()
 
 
 # =====================================================================
@@ -1640,13 +1934,13 @@ def inject_design():
     st.markdown(NBS_CSS, unsafe_allow_html=True)
 
 
-def render_hero(text="Ремиксы с новым битом, 20+ эффектов, музыка с нуля на нейросети, обложка и SEO для YouTube."):
+def render_hero(text="Ремиксы с новым битом, 20+ эффектов, студийный мастеринг, музыка с нуля на нейросети, готовое видео, обложка и SEO для YouTube."):
     st.markdown(f"""
 <div class="nbs-hero">
   <div class="nbs-eq"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
   <div class="nbs-logo">NBS<span>SOFT MUSIC</span></div>
   <p>{text}</p>
-  <div class="nbs-tags"><b>Ремиксы</b><b>Новый бит</b><b>8D и 20+ эффектов</b><b>ИИ-генерация</b><b>Обложка и SEO</b></div>
+  <div class="nbs-tags"><b>Ремиксы</b><b>Новый бит</b><b>8D и 20+ эффектов</b><b>Мастеринг −14 LUFS</b><b>Видео для YouTube</b><b>ИИ-генерация</b></div>
 </div>""", unsafe_allow_html=True)
 
 
@@ -1706,12 +2000,35 @@ AI_STYLE_PROMPTS = {
 
 def get_stability_key():
     """Ключ из Secrets (Streamlit Cloud → Settings → Secrets: STABILITY_API_KEY = "...") или из поля ввода."""
-    if os.environ.get("STABILITY_API_KEY"):        # свой сервер: ключ из файла .env
-        return os.environ["STABILITY_API_KEY"]
-    try:
-        return st.secrets.get("STABILITY_API_KEY", "")
-    except Exception:  # файла secrets нет — это нормально
-        return ""
+    return get_setting("STABILITY_API_KEY", "")
+
+
+def ai_context(username):
+    """Чей ключ используется и как платится генерация: own — свой ключ, admin — безлимит, credits — баланс."""
+    own = st.session_state.get("own_key", "").strip()
+    if own:
+        return own, "own"
+    server_key = get_stability_key()
+    if not server_key:
+        return "", "none"
+    return server_key, "admin" if is_admin(username) else "credits"
+
+
+def ai_block_reason(api_key, mode, username):
+    if not api_key:
+        return "Нейросеть не подключена. Добавьте свой ключ Stability AI в боковой панели слева."
+    if mode == "credits" and (get_user(username) or {}).get("ai_credits", 0) <= 0:
+        return "На балансе 0 ИИ-генераций. " + get_setting("BUY_INFO", "Чтобы пополнить, напишите администратору.")
+    return None
+
+
+def charge_ai(username, mode, reason):
+    return True if mode in ("own", "admin") else spend_credit(username, reason)
+
+
+def refund_ai(username, mode, reason):
+    if mode == "credits":
+        add_credits(username, 1, "возврат: " + reason)
 
 
 def build_ai_prompt(style, extra="", bpm=None, key_name=None):
@@ -1787,11 +2104,78 @@ def _raise_stability_error(resp):
     raise RuntimeError(f"Stability AI ответил {resp.status_code}: {msg}" + (f" — {hint}" if hint else ""))
 
 
+def render_admin(me):
+    st.subheader("🛠 Админ-панель")
+    users = list_users()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Пользователей", len(users))
+    c2.metric("Активных", sum(1 for u in users if u["is_active"]))
+    c3.metric("Генераций на балансах", sum(int(u["ai_credits"] or 0) for u in users))
+    st.dataframe([{"Логин": u["username"], "Статус": "активен" if u["is_active"] else "заблокирован",
+                   "ИИ-генераций": int(u["ai_credits"] or 0), "Регистрация": u["created_at"] or "—"} for u in users],
+                 hide_index=True, width="stretch")
+    if not users:
+        st.info("Пока никто не зарегистрировался.")
+        return
+    sel = st.selectbox("Пользователь", [u["username"] for u in users], key="adm_user")
+    u = get_user(sel)
+    st.markdown(f"**{sel}** · баланс: **{int(u['ai_credits'] or 0)}** · "
+                f"{'активен' if u['is_active'] else 'заблокирован'}")
+    with st.form("adm_credits", clear_on_submit=True):
+        c1, c2 = st.columns([1, 2])
+        amount = c1.number_input("Начислить генераций (минус — списать)", -1000, 1000, 10, 1)
+        note = c2.text_input("Комментарий", placeholder="Kaspi 2 000 ₸, 23.10")
+        if st.form_submit_button("💳 Изменить баланс", type="primary"):
+            add_credits(sel, int(amount), f"админ {me}: {note}".strip())
+            st.success(f"Баланс {sel} изменён на {int(amount):+d}.")
+            st.rerun()
+    c1, c2 = st.columns(2)
+    if sel.lower() != me.lower():
+        if u["is_active"]:
+            if c1.button("🚫 Заблокировать", key="adm_block"):
+                set_active(sel, False)
+                st.rerun()
+        elif c1.button("✅ Разблокировать", key="adm_unblock"):
+            set_active(sel, True)
+            st.rerun()
+    with c2.popover("🔑 Новый пароль"):
+        new_pw = st.text_input("Новый пароль (от 6 символов)", type="password", key="adm_pw")
+        if st.button("Сохранить пароль", key="adm_pw_btn"):
+            if len(new_pw) < 6:
+                st.error("Пароль короче 6 символов.")
+            else:
+                set_password(sel, new_pw)
+                st.success("Пароль изменён. Передайте его пользователю.")
+    hist = credit_history(sel)
+    if hist:
+        st.markdown("**История баланса**")
+        st.dataframe([{"Время (UTC)": t, "Изменение": f"{d:+d}", "Причина": r} for t, d, r in hist],
+                     hide_index=True, width="stretch")
+
+
 def render_results(res):
     st.success("🎉 Готово! Трек, обложка и SEO созданы.")
     st.subheader("📥 Результаты")
     st.image(res["cover"], caption="Обложка для YouTube (1280×720)")
-    st.audio(res["wav"], format="audio/wav")
+    st.markdown("**🎧 Сравните: до и после**")
+    c1, c2 = st.columns(2)
+    if res.get("orig"):
+        c1.caption("Оригинал")
+        c1.audio(res["orig"])
+    c2.caption("Результат")
+    c2.audio(res["wav"], format="audio/wav")
+    rep = res.get("master")
+    if rep:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Громкость", f"{rep['lufs_out']:.1f} LUFS", f"{rep['lufs_out'] - rep['lufs_in']:+.1f} дБ")
+        c2.metric("Пик (true peak)", f"{rep['tp_out']:.1f} dBTP")
+        c3.metric("Длительность", f"{int(res['duration'] // 60)}:{int(res['duration'] % 60):02d}")
+        st.caption(f"Мастеринг: {rep['target']}. Пик ниже потолка — на YouTube и в плеерах не будет искажений.")
+    if res.get("video"):
+        st.markdown("**🎬 Видео для YouTube**")
+        st.video(res["video"])
+    elif res.get("video_error"):
+        st.warning(f"Видео не получилось: {res['video_error']}")
     if res.get("fx"):
         st.markdown("**🎚️ Эффекты:** " + ", ".join(res["fx"]))
 
@@ -1820,14 +2204,16 @@ def render_results(res):
     elif res.get("ai_error"):
         st.warning(f"ИИ-версия не получилась. {res['ai_error']}")
 
-    cols = st.columns(3 if res.get("mp3") else 2)
-    cols[0].download_button("🖼️ Обложка (JPG)", res["cover"], f"{res['slug']}_cover.jpg",
-                            "image/jpeg", key="dl_cover")
-    cols[1].download_button("🎧 Ремикс (WAV)", res["wav"], f"{res['slug']}.wav",
-                            "audio/wav", key="dl_wav")
+    st.markdown("**📥 Скачать**")
+    items = [("🖼️ Обложка JPG", res["cover"], f"{res['slug']}_cover.jpg", "image/jpeg"),
+             (f"🎧 WAV {res.get('bits', 16)} бит", res["wav"], f"{res['slug']}.wav", "audio/wav")]
     if res.get("mp3"):
-        cols[2].download_button("🎵 Ремикс (MP3)", res["mp3"], f"{res['slug']}.mp3",
-                                "audio/mpeg", key="dl_mp3")
+        items.append(("🎵 MP3 320 кбит/с", res["mp3"], f"{res['slug']}.mp3", "audio/mpeg"))
+    if res.get("video"):
+        items.append(("🎬 Видео MP4", res["video"], f"{res['slug']}.mp4", "video/mp4"))
+    cols = st.columns(len(items))
+    for i, (label, data, name, mime) in enumerate(items):
+        cols[i].download_button(label, data, name, mime, key=f"dl_{i}", width="stretch")
 
     st.markdown("---")
     st.subheader("🚀 YouTube SEO (English)")
@@ -1851,24 +2237,42 @@ def main():
         render_auth()
         st.stop()
 
-    # --- Боковая панель: аккаунт и ключ нейросети ---
+    session_keys = ("logged_in", "username", "result", "file_key", "beat_cache", "gen_track", "admin_mode")
+    username = st.session_state["username"]
+    user = get_user(username)
+    if not user or not user["is_active"]:
+        for key in session_keys:
+            st.session_state.pop(key, None)
+        st.error("Аккаунт заблокирован или удалён. Обратитесь к администратору.")
+        st.stop()
+    admin = is_admin(username)
+
+    # --- Боковая панель: аккаунт, баланс ИИ, админка ---
     with st.sidebar:
         st.markdown("<div class='nbs-side-logo'>NBS<span>SOFT MUSIC</span></div>", unsafe_allow_html=True)
         st.write("")
-        st.write(f"👤 **{st.session_state['username']}**")
-        st.markdown("**🔑 Нейросеть Stability AI**")
-        api_key = get_stability_key()
-        if api_key:
-            st.caption("Ключ подключён через Secrets ✓")
+        st.write(f"👤 **{username}**" + (" · администратор" if admin else ""))
+        st.markdown("**🤖 ИИ-генерации**")
+        if admin:
+            st.caption("Безлимит (администратор)")
         else:
-            api_key = st.text_input("API-ключ", type="password", key="stab_key_input",
-                                    help="platform.stability.ai → API Keys. На Streamlit Cloud лучше сохранить "
-                                         "в Settings → Secrets как STABILITY_API_KEY.")
-        st.caption("Нужен для «Создать с нуля» и «Профи ИИ-ремикс». Одна генерация — 20 кредитов (≈ $0.20).")
+            st.metric("Баланс", int(user["ai_credits"] or 0))
+            st.caption(get_setting("BUY_INFO", "Чтобы пополнить, напишите администратору."))
+        with st.expander("Свой ключ Stability AI"):
+            st.text_input("API-ключ", type="password", key="own_key",
+                          help="platform.stability.ai → API Keys")
+            st.caption("Со своим ключом генерации не списываются с баланса: платит ваш счёт Stability.")
+        if admin:
+            st.toggle("🛠 Админ-панель", key="admin_mode")
         if st.button("🚪 Выйти"):
-            for key in ("logged_in", "username", "result", "file_key", "beat_cache", "gen_track"):
+            for key in session_keys:
                 st.session_state.pop(key, None)
             st.rerun()
+
+    api_key, ai_mode = ai_context(username)
+    if admin and st.session_state.get("admin_mode"):
+        render_admin(username)
+        return
 
     render_hero()
 
@@ -1898,10 +2302,16 @@ def main():
             g_model = st.selectbox("Модель", ["stable-audio-2.5", "stable-audio-2"], key="gen_model")
             g_prompt = build_gen_prompt(g_style, GEN_MOODS[g_mood], g_bpm, g_extra)
             st.caption(f"Промпт для нейросети: {g_prompt}")
-            if st.button("✨ Сгенерировать трек · 20 кредитов ≈ $0.20", type="primary", key="gen_btn"):
-                if not api_key:
-                    st.error("Добавьте API-ключ Stability AI в боковой панели слева.")
+            cost_note = {"credits": "списывается 1 генерация с баланса", "admin": "безлимит",
+                         "own": "оплата с вашего ключа Stability", "none": "нейросеть не подключена"}[ai_mode]
+            if st.button(f"✨ Сгенерировать трек · {cost_note}", type="primary", key="gen_btn"):
+                reason = ai_block_reason(api_key, ai_mode, username)
+                if reason:
+                    st.error(reason)
+                elif not charge_ai(username, ai_mode, "трек с нуля"):
+                    st.error(ai_block_reason(api_key, ai_mode, username) or "Не удалось списать генерацию.")
                 else:
+                    generated = False
                     with st.spinner("Нейросеть сочиняет трек, обычно это до минуты…"):
                         try:
                             seed = random.randint(1, 4_000_000)
@@ -1909,8 +2319,12 @@ def main():
                             st.session_state["gen_track"] = {"bytes": audio, "name": f"nbs_{g_style}_{seed}.mp3",
                                                              "prompt": g_prompt, "bpm": g_bpm}
                             st.session_state.pop("result", None)
+                            generated = True
                         except Exception as err:
-                            st.error(str(err))
+                            refund_ai(username, ai_mode, "трек с нуля")
+                            st.error(f"{err}. Генерация возвращена на баланс." if ai_mode == "credits" else str(err))
+                    if generated:
+                        st.rerun()          # обновить баланс в боковой панели
             gen = st.session_state.get("gen_track")
             if gen:
                 source_bytes, source_name, source_bpm = gen["bytes"], gen["name"], gen["bpm"]
@@ -2072,8 +2486,11 @@ def main():
                                  "живее и «дороже» по звуку. 20 кредитов Stability (≈ $0.20) за генерацию.")
         ai_source, ai_strength, ai_extra, ai_model = "remix", 0.75, "", "stable-audio-2.5"
         if ai_on:
-            if not api_key:
-                st.warning("Добавьте API-ключ Stability AI в боковой панели слева.")
+            reason = ai_block_reason(api_key, ai_mode, username)
+            if reason:
+                st.warning(reason)
+            elif ai_mode == "credits":
+                st.caption("За ИИ-ремикс с баланса списывается 1 генерация (если нейросеть вернёт ошибку — вернётся).")
             ai_source = st.radio("Что отправить нейросети", ["remix", "original"], horizontal=True,
                                  format_func={"remix": "Готовый трек со всеми эффектами (рекомендуется)",
                                               "original": "Исходный трек"}.get)
@@ -2085,7 +2502,42 @@ def main():
             st.caption(f"Нейросеть обрабатывает до {AI_MAX_SECONDS // 60} мин {AI_MAX_SECONDS % 60} с трека. "
                        "Загружайте только свои треки или треки с лицензией: Stability проверяет загрузки.")
 
-    if st.button("🚀 Создать трек, обложку и SEO", type="primary", use_container_width=True):
+    # --- Шаг 7. Мастеринг и экспорт ---
+    has_ffmpeg = shutil.which("ffmpeg") is not None
+    with st.container(border=True):
+        step_title(7, "💎 Мастеринг и экспорт")
+        master_on = st.checkbox("Профессиональный мастеринг", value=True,
+                                help="Ровная громкость по стандарту площадки, лимитер без искажений, плотный бас.")
+        tnames = {key: t["name"] for key, t in MASTER_TARGETS.items()}
+        m_target = st.selectbox("Громкость под площадку", list(tnames), format_func=tnames.get,
+                                disabled=not master_on, key="m_target")
+        with st.expander("Тонкая настройка мастеринга"):
+            m_glue = st.slider("Склейка (шинный компрессор)", 0.0, 1.0, 0.3, 0.05, key="m_glue",
+                               help="Собирает все звуки в один плотный микс. Больше — плотнее, меньше — живее.")
+            m_mono = st.checkbox("Плотный бас: всё ниже 120 Гц в центр", value=True, key="m_mono")
+            m_warm = st.slider("Теплота (середина-низ)", 0.0, 1.0, 0.0, 0.05, key="m_warm")
+            m_air = st.slider("Воздух (блеск верхов)", 0.0, 1.0, 0.0, 0.05, key="m_air")
+        master_opts = dict(on=master_on, target=m_target, glue=m_glue, mono_bass=m_mono, warmth=m_warm, air=m_air)
+
+        st.markdown("**✂️ Обрезка и плавность**")
+        c1, c2 = st.columns(2)
+        trim_start = c1.number_input("Начать с, сек", 0.0, 900.0, 0.0, 0.5, key="trim_start")
+        trim_end = c2.number_input("Закончить на, сек (0 — до конца)", 0.0, 900.0, 0.0, 0.5, key="trim_end")
+        c1, c2 = st.columns(2)
+        fade_in = c1.slider("Плавное начало, сек", 0.0, 10.0, 0.0, 0.5, key="fade_in")
+        fade_out = c2.slider("Плавный конец, сек", 0.0, 15.0, 3.0, 0.5, key="fade_out")
+
+        st.markdown("**📦 Форматы**")
+        wav24 = st.checkbox("WAV 24 бит (студийный; иначе 16 бит с дизерингом)", value=False, key="wav24")
+        make_mp4 = st.checkbox("🎬 Видео для YouTube: MP4 1080p, обложка + живая волна звука",
+                               value=has_ffmpeg, disabled=not has_ffmpeg, key="make_mp4")
+        if not has_ffmpeg:
+            st.caption("Видео собирается на сервере с ffmpeg (Render, свой сервер).")
+
+    if st.button("🚀 Создать трек, обложку и SEO", type="primary", width="stretch"):
+        if trim_end and trim_end <= trim_start:
+            st.warning("Конец обрезки должен быть позже начала.")
+            st.stop()
         if not song_title.strip():
             st.warning("Введите название трека.")
             st.stop()
@@ -2103,13 +2555,20 @@ def main():
                     st.error(f"Трек длиннее {MAX_TRACK_MINUTES} минут.")
                     st.stop()
                 y, sr = load_audio(tmp.name)
+                i0 = int(trim_start * sr)
+                i1 = int(trim_end * sr) if trim_end else y.shape[1]
+                if i0 >= y.shape[1] - sr:
+                    status.update(label="Неверная обрезка", state="error")
+                    st.error("Начало обрезки дальше конца трека.")
+                    st.stop()
+                y = y[:, i0:i1]
                 y_original = y
 
                 beat_info = None
                 if beat_on:
                     # Анализ и разделение на дорожки дорогие — кэшируем на текущий файл
                     cache = st.session_state.get("beat_cache")
-                    cache_key = (file_key, use_sep)
+                    cache_key = (file_key, use_sep, trim_start, trim_end)
                     if not cache or cache["key"] != cache_key:
                         stems = None
                         if use_sep:
@@ -2139,18 +2598,23 @@ def main():
                     base_bpm = source_bpm or float(np.atleast_1d(librosa.beat.beat_track(y=y.mean(0), sr=sr)[0])[0])
                     fx_bpm = (base_bpm or 120.0) * (speed if link else tempo)
 
-                st.write("🎚️ Применяем эффекты и мастеринг…")
-                y = process_audio(y, sr, settings, fx, fx_bpm or 120.0)
-                wav = encode_audio(y, sr, "WAV")
+                st.write("🎚️ Эффекты и мастеринг…" if master_on else "🎚️ Применяем эффекты…")
+                y, master_report = process_audio(y, sr, settings, fx, fx_bpm or 120.0, master=master_opts,
+                                                 fades=(max(fade_in, 0.02), max(fade_out, 0.05)))
+                bits = 24 if wav24 else 16
+                wav = encode_audio(y, sr, "WAV", bits=bits)
                 try:
                     mp3 = encode_audio(y, sr, "MP3")
-                except Exception:  # старая libsndfile без MP3 — отдаём только WAV
+                except Exception:  # нет ни ffmpeg, ни MP3 в libsndfile — отдаём только WAV
                     mp3 = None
 
                 ai_mp3, ai_error, ai_prompt = None, None, ""
                 if ai_on:
-                    if not api_key:
-                        ai_error = "Не указан API-ключ Stability AI (боковая панель слева)."
+                    block = ai_block_reason(api_key, ai_mode, username)
+                    if block:
+                        ai_error = block
+                    elif not charge_ai(username, ai_mode, "профи ИИ-ремикс"):
+                        ai_error = ai_block_reason(api_key, ai_mode, username) or "Не удалось списать генерацию."
                     else:
                         st.write("🤖 Нейросеть Stable Audio перегенерирует трек (обычно до минуты)…")
                         src = y if ai_source == "remix" else y_original
@@ -2174,7 +2638,8 @@ def main():
                                 min(AI_MAX_SECONDS, src.shape[1] / sr), api_key, ai_model,
                                 int(st.session_state.get("beat_seed", 1)))
                         except Exception as err:
-                            ai_error = str(err)
+                            refund_ai(username, ai_mode, "профи ИИ-ремикс")
+                            ai_error = str(err) + (". Генерация возвращена на баланс." if ai_mode == "credits" else "")
 
                 st.write("🎨 Рисуем обложку…")
                 background = None
@@ -2185,6 +2650,14 @@ def main():
                         st.warning("Не удалось открыть ваш фон — использую стандартный.")
                 background = background or fetch_background(genre["photos"]) or gradient_background(genre["accent"])
                 cover = make_cover(song_title, artist_name, genre_text, genre["accent"], background)
+
+                video, video_error = None, None
+                if make_mp4 and has_ffmpeg:
+                    st.write("🎬 Собираем видео для YouTube (для 3-минутного трека — около 2–5 минут)…")
+                    try:
+                        video = make_video(cover, encode_audio(y, sr, "WAV", bits=16), genre["accent"])
+                    except Exception as err:
+                        video_error = str(err)
 
                 st.write("🚀 Готовим SEO…")
                 titles, description, tags = make_seo(song_title, artist_name, genre["short"], p["label"])
@@ -2203,6 +2676,8 @@ def main():
             wav=wav, mp3=mp3, cover=cover, titles=titles, description=description,
             tags=tags, slug=slugify(f"{artist_name}_{song_title}"), beat=beat_info,
             ai_mp3=ai_mp3, ai_error=ai_error, ai_prompt=ai_prompt, fx=active_fx(fx),
+            orig=source_bytes, master=master_report, bits=bits, duration=y.shape[1] / sr,
+            video=video, video_error=video_error,
         )
 
     if "result" in st.session_state:
