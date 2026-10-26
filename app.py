@@ -70,10 +70,20 @@ GENRES = {
         "short": "Synthwave", "preset": "Synthwave", "beat": "synth",
         "photos": [1015, 1047, 1084], "accent": (255, 110, 220),
     },
+    "DISCO / ДИСКОТЕКА (Танцпол, 120 BPM)": {
+        "short": "Disco", "preset": "Disco", "beat": "disco",
+        "photos": [1015, 1060, 1068], "accent": (255, 205, 80),
+    },
+    "POP REMIX (Яркий радио-звук)": {
+        "short": "Pop Remix", "preset": "Bright Pop", "beat": "dance",
+        "photos": [1016, 1042, 1015], "accent": (255, 150, 90),
+    },
 }
 
 # Пресеты ремикса. link=True — «эффект пластинки»: тон меняется вместе со скоростью.
 PRESETS = {
+    "Disco": {"label": "Disco Remix", "link": False, "speed": 1.0,
+              "tempo": 1.0, "pitch": 0.0, "reverb": 0.12, "vinyl": 0.0, "bass": 0.1},
     "Slowed & Reverb": {"label": "Slowed + Reverb", "link": True, "speed": 0.85,
                         "tempo": 1.0, "pitch": 0.0, "reverb": 0.55, "vinyl": 0.2, "bass": 0.1},
     "Sped Up / Nightcore": {"label": "Sped Up", "link": True, "speed": 1.20,
@@ -86,6 +96,10 @@ PRESETS = {
                    "tempo": 1.02, "pitch": 0.0, "reverb": 0.15, "vinyl": 0.0, "bass": 0.4},
     "Synthwave": {"label": "Synthwave Remix", "link": False, "speed": 1.0,
                   "tempo": 0.97, "pitch": 0.0, "reverb": 0.45, "vinyl": 0.1, "bass": 0.2},
+    "Bright Pop": {"label": "Pop Remix", "link": False, "speed": 1.0,
+                   "tempo": 1.04, "pitch": 2.0, "reverb": 0.15, "vinyl": 0.0, "bass": 0.25},
+    "Deep / Dark": {"label": "Deep Dark Remix", "link": False, "speed": 1.0,
+                    "tempo": 0.94, "pitch": -3.0, "reverb": 0.35, "vinyl": 0.0, "bass": 0.5},
     "Свои настройки": {"label": "Remix", "link": False, "speed": 1.0,
                        "tempo": 1.0, "pitch": 0.0, "reverb": 0.0, "vinyl": 0.0, "bass": 0.0},
 }
@@ -296,12 +310,13 @@ def rubberband_available():
     return shutil.which("rubberband") is not None
 
 
-def _rubberband(y, sr, pitch, tempo):
-    """Студийная смена темпа/тона через Rubber Band (движок R3): чище, без «фазового» призвука."""
+def _rubberband(y, sr, pitch, tempo, formant=False):
+    """Студийная смена темпа/тона через Rubber Band (движок R3): чище, без «фазового» призвука.
+    formant=True — тембр голоса сохраняется (нет «бурундука» и «великана»)."""
     with tempfile.TemporaryDirectory() as tmp:
         src, dst = os.path.join(tmp, "in.wav"), os.path.join(tmp, "out.wav")
         sf.write(src, y.T, sr, subtype="FLOAT")
-        base = ["rubberband", "-q", "-T", f"{tempo:.6f}", "-p", f"{pitch:.4f}"]
+        base = ["rubberband", "-q", "-T", f"{tempo:.6f}", "-p", f"{pitch:.4f}"] + (["-F"] if formant and pitch else [])
         for engine in (["--fine"], []):            # R3, если версия умеет; иначе стандартный движок
             res = subprocess.run(base + engine + [src, dst], capture_output=True, timeout=900)
             if res.returncode == 0 and os.path.exists(dst):
@@ -310,19 +325,154 @@ def _rubberband(y, sr, pitch, tempo):
         raise RuntimeError(res.stderr.decode(errors="ignore")[:300])
 
 
-def shift_pitch_and_tempo(y, sr, pitch, tempo):
+def pv_stretch(y, rate, n_fft=4096, hop=1024):
+    """Смена темпа без изменения тона: фазовый вокодер с фиксацией фаз (identity phase locking).
+    Фазы считаются по «середине» стерео и одинаково применяются к обоим каналам — стерео не «плывёт».
+    rate > 1 — быстрее, < 1 — медленнее."""
+    y = np.asarray(y, np.float32)
+    if y.ndim == 1:
+        y = y[None, :]
+    if abs(rate - 1) < 1e-3:
+        return y
+    win = np.hanning(n_fft).astype(np.float32)
+    pad = np.pad(y, ((0, 0), (n_fft, n_fft)))
+    frames = 1 + (pad.shape[1] - n_fft) // hop
+    X = np.stack([np.fft.rfft(np.lib.stride_tricks.sliding_window_view(pad[c], n_fft)[::hop][:frames] * win, axis=1)
+                  for c in range(y.shape[0])]).astype(np.complex64)
+    M = X.mean(0)
+    mag_c, ph_c = np.abs(X), np.angle(X)
+    ph_m, mag_m = np.angle(M), np.abs(M)
+    bins = X.shape[2]
+    omega = (2 * np.pi * hop * np.arange(bins) / n_fft).astype(np.float32)
+    steps = np.arange(0, frames - 1, rate)
+    out_len = len(steps) * hop + n_fft
+    out = np.zeros((y.shape[0], out_len), np.float32)
+    norm = np.zeros(out_len, np.float32)
+    acc = ph_m[0].copy()
+    idx = np.arange(bins)
+    for i, t in enumerate(steps):
+        k = int(t)
+        a = np.float32(t - k)
+        m = (1 - a) * mag_m[k] + a * mag_m[k + 1]
+        # пики спектра и «зоны влияния» каждого пика (граница — середина между пиками)
+        pk = np.where((m[1:-1] > m[:-2]) & (m[1:-1] >= m[2:]))[0] + 1
+        if len(pk) == 0:
+            pk = np.array([int(np.argmax(m))])
+        bounds = (pk[:-1] + pk[1:]) // 2
+        owner = pk[np.searchsorted(bounds, idx, side="right")]
+        out_ph = acc[owner] + (ph_m[k] - ph_m[k][owner])
+        rot = out_ph - ph_m[k]
+        for c in range(y.shape[0]):
+            mc = (1 - a) * mag_c[c, k] + a * mag_c[c, k + 1]
+            frame = np.fft.irfft(mc * np.exp(1j * (ph_c[c, k] + rot)), n_fft).astype(np.float32) * win
+            out[c, i * hop:i * hop + n_fft] += frame
+        norm[i * hop:i * hop + n_fft] += win ** 2
+        dphi = ph_m[k + 1] - ph_m[k] - omega
+        dphi -= 2 * np.pi * np.round(dphi / (2 * np.pi))
+        acc = out_ph + omega + dphi
+    out /= np.maximum(norm, 1e-3)
+    target = int(round(y.shape[1] / rate))
+    return out[:, n_fft:n_fft + target]
+
+
+def stretch_tempo(y, sr, rate):
+    """Темп ×rate без изменения тона: Rubber Band (студийный движок), если есть, иначе фазовый вокодер."""
+    if abs(rate - 1) < 1e-3:
+        return np.asarray(y, np.float32)
+    if rubberband_available():
+        try:
+            return _rubberband(np.asarray(y, np.float32), sr, 0.0, rate).astype(np.float32)
+        except Exception:
+            pass
+    return pv_stretch(y, rate)
+
+
+HZ432_SEMITONES = 12 * np.log2(432 / 440)        # −0,318 полутона: строй A = 432 Гц
+
+
+def _envelope(logmag, lifter, iters=12):
+    """Спектральная огибающая (форманты) кадра — «истинная огибающая»: кепстральное сглаживание,
+    поднятое до вершин гармоник (обычное сглаживание проваливается между гармониками и зависит от ноты)."""
+    a = logmag.copy()
+    for _ in range(iters):
+        c = np.fft.irfft(a, axis=-1)
+        c[..., lifter:-lifter] = 0
+        v = np.fft.rfft(c, axis=-1).real[..., :logmag.shape[-1]]
+        a = np.maximum(logmag, v)
+    return v
+
+
+LIFTER_MS = 2.2
+
+
+def formant_fix(y_out, y_ref, sr, rate=1.0, n_fft=2048, hop=512, max_db=15.0, batch=256):
+    """Возвращает сигналу после смены тона тембр оригинала: огибающая спектра (форманты голоса)
+    берётся из y_ref, тонкая структура (ноты) — из y_out. rate — во сколько раз y_out быстрее y_ref.
+    Считается пачками кадров — память не растёт с длиной трека."""
+    y_out, y_ref = np.asarray(y_out, np.float32), np.asarray(y_ref, np.float32)
+    win = np.hanning(n_fft).astype(np.float32)
+    lifter = max(8, int(sr * LIFTER_MS / 1000))  # 2,2 мс: F1 и F2 голоса различимы, гармоники — нет
+    lim = max_db / 20 * np.log(10)
+    low_bins = int(80 / sr * n_fft)
+    half = n_fft // 2
+    ref_pad = np.pad(y_ref.mean(0), (half, half + n_fft))
+    n_frames = y_out.shape[1] // hop + 1
+    out = np.zeros_like(y_out)
+    for c in range(y_out.shape[0]):
+        pad = np.pad(y_out[c], (half, half + n_fft))
+        acc = np.zeros(len(pad), np.float32)
+        norm = np.zeros(len(pad), np.float32)
+        for b0 in range(0, n_frames, batch):
+            ii = np.arange(b0, min(n_frames, b0 + batch))
+            X = np.fft.rfft(np.stack([pad[i * hop:i * hop + n_fft] for i in ii]) * win, axis=1)
+            jj = np.clip(np.round(ii * rate).astype(int), 0, (len(ref_pad) - n_fft) // hop)
+            R = np.fft.rfft(np.stack([ref_pad[j * hop:j * hop + n_fft] for j in jj]) * win, axis=1)
+            env_r = _envelope(np.log(np.abs(R) + 1e-6), lifter)
+            env_o = _envelope(np.log(np.abs(X) + 1e-6), lifter)
+            g = np.exp(np.clip(env_r - env_o, -lim, lim))
+            g[:, :low_bins] = 1.0                 # бас и бочку не трогаем
+            fr = np.fft.irfft(X * g, n_fft, axis=1).astype(np.float32) * win
+            for k, i in enumerate(ii):
+                acc[i * hop:i * hop + n_fft] += fr[k]
+                norm[i * hop:i * hop + n_fft] += win ** 2
+        acc /= np.maximum(norm, 1e-3)
+        out[c] = acc[half:half + y_out.shape[1]]
+    return out
+
+
+def shift_pitch_and_tempo(y, sr, pitch, tempo, formant=False):
+    """Тон (полутоны) и темп (×) независимо. formant=True — голос остаётся живым при сильном сдвиге."""
     if not pitch and abs(tempo - 1.0) <= 1e-3:
         return y
     if rubberband_available():
         try:
-            return _rubberband(y, sr, pitch, tempo)
+            return _rubberband(y, sr, pitch, tempo, formant)
         except Exception:
-            pass                                    # запасной путь — librosa
+            pass                                    # запасной путь — свой фазовый вокодер
+    y = np.asarray(y, np.float32)
+    ref = y
     if pitch:
-        y = librosa.effects.pitch_shift(y, sr=sr, n_steps=pitch)
-    if abs(tempo - 1.0) > 1e-3:
-        y = librosa.effects.time_stretch(y, rate=tempo)
+        q = 2 ** (pitch / 12)
+        y = change_speed(pv_stretch(y, tempo / q), sr, q)   # растянуть, затем «пластинкой» поднять тон
+    elif abs(tempo - 1.0) > 1e-3:
+        y = pv_stretch(y, tempo)
+    if formant and abs(pitch) >= .5:
+        y = formant_fix(y, ref, sr, rate=tempo)
     return y
+
+
+def vinyl_speed(y, sr, factor, formant=False):
+    """Эффект пластинки (тон и скорость вместе). formant=True — тот же сдвиг, но тембр голоса живой."""
+    if abs(factor - 1.0) < 1e-3:
+        return y
+    if not formant or abs(12 * np.log2(factor)) < .5:
+        return change_speed(y, sr, factor)
+    if rubberband_available():
+        try:
+            return _rubberband(np.asarray(y, np.float32), sr, 12 * np.log2(factor), factor, True)
+        except Exception:
+            pass
+    return formant_fix(change_speed(y, sr, factor), y, sr, rate=factor)
 
 
 def bass_boost(y, sr, amount):
@@ -1020,7 +1170,9 @@ def mono_bass(y, sr, freq=120.0):
 def master_audio(y, sr, opts=None):
     """Мастеринг-цепочка. Возвращает (сигнал, отчёт о громкости)."""
     o = {**MASTER_DEFAULTS, **(opts or {})}
-    tgt = MASTER_TARGETS[o["target"]]
+    tgt = MASTER_TARGETS.get(o["target"], MASTER_TARGETS["youtube"])
+    if o.get("lufs") is not None:                         # громкость «как у образца»
+        tgt = {"name": f"Как у образца ({o['lufs']:.0f} LUFS)", "lufs": float(o["lufs"]), "ceiling": -1.0}
     report = {"lufs_in": integrated_lufs(y, sr), "tp_in": true_peak_db(y)}
     y = highpass(np.asarray(y, np.float32), sr, 22, order=2)                         # убираем инфразвук и постоянную составляющую
     if y.shape[0] == 2 and o["mono_bass"]:
@@ -1045,14 +1197,17 @@ def master_audio(y, sr, opts=None):
     return y, report
 
 
-def process_audio(y, sr, s, fx=None, bpm=120.0, master=None, fades=(0.02, 0.05), ambience=None):
+def process_audio(y, sr, s, fx=None, bpm=120.0, master=None, fades=(0.02, 0.05), ambience=None, match=None):
     """Скорость/тон → эффекты → пространство → винил → мастеринг. Возвращает (сигнал, отчёт)."""
     if y.shape[0] == 1:
         y = np.repeat(y, 2, axis=0)
+    fm = s.get("formant", True)
     if s["link"]:
-        y = change_speed(y, sr, s["speed"])
+        y = vinyl_speed(y, sr, s["speed"], fm)
+        if s.get("hz432"):
+            y = shift_pitch_and_tempo(y, sr, HZ432_SEMITONES, 1.0)
     else:
-        y = shift_pitch_and_tempo(y, sr, s["pitch"], s["tempo"])
+        y = shift_pitch_and_tempo(y, sr, s["pitch"] + (HZ432_SEMITONES if s.get("hz432") else 0), s["tempo"], fm)
     y = normalize(y, -3.0)
     y = apply_effects(y, sr, fx, bpm)
     y = bass_boost(y, sr, s["bass"])
@@ -1064,6 +1219,12 @@ def process_audio(y, sr, s, fx=None, bpm=120.0, master=None, fades=(0.02, 0.05),
     y = apply_vinyl(y, sr, s["vinyl"])
     if ambience and ambience.get("loop") is not None:
         y = mix_ambience(y, sr, ambience["loop"], ambience.get("level_db", -14.0))
+    if match and match.get("curve"):                       # тембр и ширина «как у образца»
+        y, _ = match_eq(y, sr, match["curve"], amount=match.get("amount", .8))
+        if match.get("width") and y.shape[0] == 2:
+            w0 = stereo_width(y)
+            if w0 > 1e-3:
+                y = fx_width(y, float(np.clip(match["width"] / w0, .7, 1.6)))
     m = {**MASTER_DEFAULTS, **(master or {})}
     report = None
     if m["on"]:
@@ -1246,6 +1407,9 @@ def timestamps_text(stamps):
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 BEAT_STYLES = {
+    "template": {"name": "По образцу", "half": False, "swing": 0.0, "side": .35, "filter": .20},
+    "disco": {"name": "Disco / Дискотека", "half": False, "swing": 0.0, "side": .40, "filter": .20,
+              "retempo": (110, 132, 120)},
     "lofi":  {"name": "Lo-Fi boom bap",             "half": True,  "swing": .16, "side": .25, "filter": .35, "lofi": True},
     "phonk": {"name": "Drift Phonk: ковбелл и 808", "half": True,  "swing": 0.0, "side": .45, "filter": .45},
     "trap":  {"name": "Trap: 808 и роллы хэтов",    "half": True,  "swing": 0.0, "side": .35, "filter": .30},
@@ -1616,11 +1780,26 @@ def analyze(y, sr, drums=None, bass=None, harm=None, bpm_hint=None):
             roots[i] = roots[i - 1] if i else key
     hseg = chroma_per_bar(hsrc, 4096, 110, 2000)
     minor = np.array([hseg[i, (roots[i] + 3) % 12] > hseg[i, (roots[i] + 4) % 12] for i in range(nseg)])
+    # Привязка к тональности: аккорды только из лада песни — новые бас и струнные не сфальшивят
+    tonic = roots == key
+    key_minor = bool(minor[tonic].mean() >= .5) if tonic.any() else bool(minor.mean() >= .5)
+    if key_minor:   # натуральный минор; V может быть и мажорной (гармонический минор)
+        quality = {0: True, 2: True, 3: False, 5: True, 7: None, 8: False, 10: False}
+    else:
+        quality = {0: False, 2: True, 4: True, 5: False, 7: False, 9: True, 11: True}
+    for i in range(nseg):
+        deg = (roots[i] - key) % 12
+        if deg not in quality:
+            roots[i] = roots[i - 1] if i else key
+            deg = (roots[i] - key) % 12
+        q = quality.get(deg)
+        if q is not None:
+            minor[i] = q
 
     return {
         "tempo": 60.0 / float(np.median(np.diff(beats))) if len(beats) > 1 else 60 * fps / period,
         "beats": beats, "phase": phase, "bar_edges": edges,
-        "roots": roots.astype(int), "key": key, "minor": minor, "duration": dur,
+        "roots": roots.astype(int), "key": key, "minor": minor, "duration": dur, "key_minor": key_minor,
         "confidence": confidence, "sure": confidence >= 2.2,
     }
 
@@ -1663,6 +1842,30 @@ def remove_drums_hpss(y, sr, strength=1.0, progress=None):
             out[c, lo:hi] += rec * w
         if progress:
             progress((ci + 1) / len(starts))
+    return out
+
+
+def retempo_plan(bpm, style, target=None, cfg=None):
+    """Как привести трек к темпу стиля: (множитель сетки m, коэффициент скорости r, итоговый темп).
+    m ∈ {1, 2, ½} выбирается ближе к цели, r — плавная подгонка без изменения тона (0,8…1,35)."""
+    cfg = cfg or BEAT_STYLES.get(style, {}).get("retempo")
+    if not cfg or not bpm:
+        return 1, 1.0, bpm
+    lo, hi, ideal = cfg
+    target = float(min(max(target or ideal, lo), hi))
+    m = min((1, 2, .5), key=lambda k: abs(np.log(target / (bpm * k))))
+    r = float(np.clip(target / (bpm * m), .8, 1.35))
+    return m, r, bpm * m * r
+
+
+def scale_analysis(an, rate):
+    """Анализ трека после ускорения в rate раз: все времена делятся на rate."""
+    out = dict(an)
+    out["beats"] = np.asarray(an["beats"]) / rate
+    out["bar_edges"] = np.asarray(an["bar_edges"]) / rate
+    out["tempo"] = an["tempo"] * rate
+    if "duration" in an:
+        out["duration"] = an["duration"] / rate
     return out
 
 
@@ -1789,7 +1992,21 @@ def _gen_dance(r, d):
     return e
 
 
-GENERATORS = {"lofi": _gen_lofi, "phonk": _gen_phonk, "trap": _gen_trap,
+def _gen_disco(r, d):
+    """Диско: бочка на каждую долю, открытый хэт между долями, хлопок на 2 и 4, октавный бас восьмыми."""
+    e = [_ev(s, "kick", 1) for s in (0, 4, 8, 12)]
+    e += [_ev(s, "clap", .8) for s in (4, 12)] + [_ev(s, "snare", .4) for s in (4, 12)]
+    e += [_ev(s, "ohat", .55) for s in (2, 6, 10, 14)]
+    e += [_ev(s, "hat", .2 if s % 2 == 0 else .14) for s in range(16) if s % 4 != 2 and r.random() < .55 + .4 * d]
+    for i, s_ in enumerate(range(0, 16, 2)):
+        n = 0 if (i == 0 or r.random() > .2 * d) else r.choice([7, 5])
+        e.append({**_ev(s_, "dbass", .95 if i % 2 == 0 else .75, n, 1.7), "oct": i % 2})
+    if r.random() < .5 * d:
+        e.append(_ev(15, "shaker", .3))
+    return e
+
+
+GENERATORS = {"disco": _gen_disco, "lofi": _gen_lofi, "phonk": _gen_phonk, "trap": _gen_trap,
               "house": _gen_house, "synth": _gen_synth, "dance": _gen_dance}
 
 
@@ -1918,6 +2135,19 @@ class _Kit:
         self.cache[key] = x
         return x
 
+    def disco_bass(self, midi, dur, peak):
+        """Упругий диско-бас: синус + яркая пила с быстро закрывающимся фильтром."""
+        t = self._t(max(dur, .05))
+        f = _hz(midi)
+        saw = 2 * ((f * t) % 1) - 1
+        bright = sosfilt(_sos("low", min(f * 10, 2500), self.sr), saw)
+        x = .75 * np.sin(2 * np.pi * f * t) + .5 * bright * np.exp(-t / .07)
+        env = np.minimum(1, t / .004) * np.exp(-t / max(dur * .8, .05))
+        k = min(len(t), int(.015 * self.sr))
+        if k:
+            env[-k:] *= np.linspace(1, 0, k)
+        return (np.tanh(x * env * 1.4) * peak * .75).astype(np.float32)
+
     def bass(self, midi, prev_midi, dur, hard, glide, peak):
         t = self._t(dur)
         if len(t) == 0:
@@ -1954,6 +2184,185 @@ def _place(bus, x, t, gain, sr, pan=0.0):
 
 
 # =====================================================================
+# РЕМИКС ПО ОБРАЗЦУ: изучаем готовый ремикс и повторяем его рецепт на любой песне
+# =====================================================================
+
+THIRD_OCT = [31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 1000, 1250, 1600,
+             2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000]
+
+
+def third_octave_curve(y, sr, max_s=120):
+    """Средний спектр по третьоктавным полосам, дБ относительно среднего (форма звучания, без громкости)."""
+    x = (y.mean(0) if y.ndim == 2 else y)[: int(max_s * sr)].astype(np.float32)
+    n_fft, hop = 8192, 4096
+    if len(x) < n_fft * 2:
+        return [0.0] * len(THIRD_OCT)
+    mag = _frames_mag(x, n_fft, hop)
+    p = (mag.astype(np.float64) ** 2).mean(0)
+    f = np.arange(len(p)) * sr / n_fft
+    out = []
+    for fc in THIRD_OCT:
+        lo, hi = fc / 2 ** (1 / 6), fc * 2 ** (1 / 6)
+        sel = (f >= lo) & (f < hi)
+        out.append(10 * np.log10(p[sel].mean() + 1e-12) if sel.any() else -120.0)
+    out = np.array(out)
+    return list(out - out[(np.array(THIRD_OCT) >= 200) & (np.array(THIRD_OCT) <= 4000)].mean())
+
+
+def match_eq(y, sr, ref_curve, amount=.8, max_db=8.0):
+    """Подгоняет тембр под образец: линейно-фазовый эквалайзер по третьоктавным полосам (±max_db)."""
+    from scipy.signal import firwin2
+    cur = np.array(third_octave_curve(y, sr))
+    ref = np.array(ref_curve)
+    diff = np.clip((ref - cur) * amount, -max_db, max_db)
+    diff = np.convolve(np.pad(diff, 1, mode="edge"), [.25, .5, .25], mode="valid")   # сглаживание
+    freqs = np.concatenate([[0], THIRD_OCT, [sr / 2]]) / (sr / 2)
+    gains = 10 ** (np.concatenate([[diff[0]], diff, [diff[-1]]]) / 20)
+    taps = firwin2(4097, np.clip(freqs, 0, 1), gains)
+    d = len(taps) // 2
+    out = np.stack([oaconvolve(ch, taps)[d:d + y.shape[1]] for ch in y]).astype(np.float32)
+    return out, list(diff)
+
+
+def stereo_width(y):
+    if y.shape[0] < 2:
+        return 0.0
+    mid, side = (y[0] + y[1]) / 2, (y[0] - y[1]) / 2
+    return float(np.sqrt(np.mean(side ** 2)) / (np.sqrt(np.mean(mid ** 2)) + 1e-12))
+
+
+def groove_profiles(y, sr, an):
+    """Рисунок бита по 16 шагам такта в четырёх полосах: бочка, бас, хлопок/снейр, хэты."""
+    asr, hop = 22050, 55
+    r = _to_sr(y.mean(0), sr, asr)
+    fps = asr / hop
+    mag = _frames_mag(r, 1024, hop)
+    bh = asr / 1024
+    bands = {"kick": (int(30 / bh), int(100 / bh)), "bass": (int(100 / bh), int(250 / bh)),
+             "snare": (int(1500 / bh), int(5000 / bh)), "hat": (int(8000 / bh), None)}
+    beats = an["beats"]
+    bars = beats[an["phase"]::4]
+    out, offs = {}, []
+    for k, (a, b) in bands.items():
+        e = _detrend(_flux(mag, a, b), w=24)
+        prof = np.zeros(16)
+        for i in range(len(bars) - 1):
+            for s_ in range(16):
+                f = int((bars[i] + (bars[i + 1] - bars[i]) * s_ / 16) * fps)
+                if f + 3 < len(e):
+                    prof[s_] += e[max(0, f - 3):f + 4].max()
+        out[k] = list(np.round(prof / (prof.max() + 1e-9), 3))
+        if k == "hat":
+            for i in range(len(bars) - 1):
+                st_ = (bars[i + 1] - bars[i]) / 16
+                for s_ in range(1, 16, 2):
+                    f, w = int((bars[i] + st_ * s_) * fps), max(1, int(st_ * .5 * fps))
+                    if w < f < len(e) - w:
+                        offs.append((np.argmax(e[f - w:f + w]) - w) / fps / st_)
+    out["swing"] = float(np.clip(np.median(offs), -.2, .3)) if offs else 0.0
+    return out
+
+
+def extract_style(y, sr, name="Мой образец"):
+    """Изучает готовый ремикс: темп, рисунок бита, тембр, ширину стерео и громкость."""
+    if y.shape[0] == 1:
+        y = np.repeat(y, 2, axis=0)
+    an = analyze(y, sr)
+    tpl = {"name": name, "tempo": float(an["tempo"]), "curve": third_octave_curve(y, sr),
+           "lufs": float(integrated_lufs(y, sr)), "width": stereo_width(y)}
+    tpl.update(groove_profiles(y, sr, an))
+    return tpl
+
+
+def _gen_template(r, d, tpl):
+    """Бит по рисунку образца: удары там, где они есть в образце, с той же силой."""
+    e = []
+    kick, bass, snare, hat = (np.array(tpl[k]) for k in ("kick", "bass", "snare", "hat"))
+    for s_ in range(16):
+        if kick[s_] >= .6:
+            e.append(_ev(s_, "kick", min(1.0, .45 + .6 * kick[s_])))
+        elif kick[s_] >= .45 and r.random() < d:
+            e.append(_ev(s_, "kick", .5))
+        if snare[s_] >= .85 and s_ != 0:
+            e += [_ev(s_, "clap", min(1.0, snare[s_])), _ev(s_, "snare", .45 * snare[s_])]
+        elif .6 <= snare[s_] < .85 and s_ % 2 == 0 and r.random() < .5 + .4 * d:
+            e.append(_ev(s_, "snare", .3))
+        if hat[s_] >= .6:
+            e.append(_ev(s_, "hat", .18 + .4 * hat[s_]))
+        elif hat[s_] >= .4 and r.random() < d:
+            e.append(_ev(s_, "hat", .14))
+    steps = [s_ for s_ in range(16) if bass[s_] >= .8] or [s_ for s_ in range(16) if kick[s_] >= .6] or [0, 8]
+    high_bass = bass.mean() > kick.mean() * 1.15            # в образце бас звучит выше (100–250 Гц) — слышно на телефоне
+    for j, s_ in enumerate(steps):
+        nxt = steps[j + 1] if j + 1 < len(steps) else 16
+        if high_bass:
+            e.append({**_ev(s_, "dbass", .9, 0, max(1.0, nxt - s_ - .2)), "oct": 1})
+        else:
+            e.append(_ev(s_, "sub", .85, 0, max(1.0, nxt - s_ - .2)))
+    return e
+
+
+def find_chorus(y, sr, an):
+    """Начало припева: самый повторяющийся и громкий фрагмент из 4 тактов в первых ¾ песни."""
+    edges = np.asarray(an["bar_edges"][1:-1])
+    if len(edges) < 16:
+        return 0.0
+    csr = 11025
+    xs = _to_sr(y.mean(0), sr, csr)
+    mg = _frames_mag(xs, 4096, 1024)
+    fr = np.arange(mg.shape[1]) * csr / 4096
+    sel = np.where((fr >= 100) & (fr <= 2500))[0]
+    pcs = np.round(69 + 12 * np.log2(fr[sel] / 440)).astype(int) % 12
+    ch = np.stack([mg[:, sel[pcs == k]].sum(1) for k in range(12)], 1)
+    en = mg.sum(1)
+    t = np.arange(len(ch)) * 1024 / csr
+    bar_ch, bar_en = [], []
+    for i in range(len(edges) - 1):
+        m = (t >= edges[i]) & (t < edges[i + 1])
+        bar_ch.append(ch[m].mean(0) if m.any() else np.zeros(12))
+        bar_en.append(en[m].mean() if m.any() else 0)
+    bar_ch = np.array(bar_ch)
+    bar_ch /= np.linalg.norm(bar_ch, axis=1, keepdims=True) + 1e-9
+    bar_en = np.array(bar_en) / (max(bar_en) + 1e-9)
+    nb = len(bar_ch) - 3
+    win = np.stack([bar_ch[i:i + 4].ravel() for i in range(nb)])
+    win /= np.linalg.norm(win, axis=1, keepdims=True) + 1e-9
+    S = win @ win.T
+    best, best_i = -1, 0
+    for i in range(nb):
+        if edges[i] < 8 or i > nb * .75:
+            continue
+        others = np.concatenate([S[i, :max(0, i - 4)], S[i, i + 5:]])
+        rep = np.sort(others)[-3:].mean() if len(others) >= 3 else 0
+        score = rep * (.5 + .5 * bar_en[i:i + 4].mean())
+        if score > best:
+            best, best_i = score, i
+    return float(edges[best_i])
+
+
+def save_style(username, tpl):
+    with closing(get_conn()) as conn, conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS styles (username TEXT, name TEXT, data TEXT, "
+                     "created_at TEXT DEFAULT (datetime('now')), PRIMARY KEY (username, name))")
+        conn.execute("INSERT OR REPLACE INTO styles (username, name, data) VALUES (?, ?, ?)",
+                     (username, tpl["name"][:60], __import__("json").dumps(tpl, ensure_ascii=False)))
+
+
+def list_styles(username):
+    with closing(get_conn()) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS styles (username TEXT, name TEXT, data TEXT, "
+                     "created_at TEXT DEFAULT (datetime('now')), PRIMARY KEY (username, name))")
+        rows = conn.execute("SELECT name, data FROM styles WHERE username = ? ORDER BY created_at DESC",
+                            (username,)).fetchall()
+    return {n: __import__("json").loads(d) for n, d in rows}
+
+
+def delete_style(username, name):
+    with closing(get_conn()) as conn, conn:
+        conn.execute("DELETE FROM styles WHERE username = ? AND name = ?", (username, name))
+
+
+# =====================================================================
 # СВЕДЕНИЕ
 # =====================================================================
 
@@ -1961,6 +2370,8 @@ def _place(bus, x, t, gain, sr, pan=0.0):
 # ---------- Музыкальные слои: аккорды, клавиши, эхо, переходы ----------
 
 LAYER_STYLES = {
+    "template": {"pad": .22, "keys": .35, "keys_type": "pluck", "bright": .5, "seventh": False, "echo": .25},
+    "disco": {"pad": .20, "keys": .55, "keys_type": "disco", "bright": .6, "seventh": True, "echo": .12},
     #        громкость пэда/клавиш, инструмент клавиш, яркость пэда, септаккорды
     "lofi":  {"pad": .25, "keys": .55, "keys_type": "rhodes", "bright": .2, "seventh": True, "echo": .25},
     "phonk": {"pad": .35, "keys": .30, "keys_type": "bell",   "bright": .1, "seventh": False, "echo": .35},
@@ -1976,7 +2387,24 @@ KEY_PATTERNS = {
     "bell":   ("arp", [0, 3, 6, 10, 12], 3),
     "arp":    ("arp", list(range(16)), 1),
     "pluck":  ("arp", [0, 2, 3, 6, 8, 10, 11, 14], 1.5),
+    "disco":  ("disco", [], None),
+    "piano":  ("chord", [(0, 7), (8, 7)], None),
+    "strings_long": ("chord", [(0, 16)], None),
 }
+# Настроение аккордов поверх песни: меняет инструмент и громкости слоёв
+CHORD_MOODS = {
+    "auto":    None,
+    "warm":    {"name": "Тёплое пианино", "keys_type": "piano", "seventh": True, "bright": .2,
+                "pad": .15, "keys": .6, "echo": .12},
+    "strings": {"name": "Струнные", "keys_type": "strings_long", "seventh": False, "bright": .3,
+                "pad": .0, "keys": .5, "echo": .0},
+    "dream":   {"name": "Мечтательный пэд", "keys_type": "bell", "seventh": True, "bright": .55,
+                "pad": .45, "keys": .28, "echo": .45},
+    "club":    {"name": "Клубное", "keys_type": "pluck", "seventh": False, "bright": .6,
+                "pad": .3, "keys": .5, "echo": .3},
+}
+DISCO_STRINGS = [(0, 3.0), (6, 1.2), (10, 2.5)]          # синкопированные стабы струнных
+DISCO_GUITAR = [1, 3, 5, 7, 9, 11, 13, 15]               # «чикен-скретч» на слабых шестнадцатых
 
 
 def _chord_at(an, t):
@@ -2030,6 +2458,26 @@ def _note(kind, midi, dur, sr):
         x = np.sin(w + 2.5 * np.exp(-t / .5) * np.sin(3.5 * w)) * np.exp(-t / .9)
     elif kind == "organ":    # хаус-орган, короткий стаб
         x = (np.sin(w) + .5 * np.sin(2 * w) + .3 * np.sin(3 * w) + .2 * np.sin(4 * w)) / 2 * np.exp(-t / .35)
+    elif kind == "strings":  # струнные: три расстроенные пилы, мягкая атака
+        x = sum(_saw(f * 2 ** (c / 1200), t, ph) for c, ph in ((-8, 0), (0, .33), (9, .66))) / 3
+        x = sosfilt(_sos("low", 4500, sr), x) * np.minimum(1, t / .02) * np.exp(-t / .5)
+    elif kind == "gtr":      # глушёная фанк-гитара (Карплус–Стронг)
+        L = max(2, int(sr / f))
+        exc = np.random.default_rng(int(midi * 7)).uniform(-1, 1, min(n, L))
+        x = lfilter([1.0], np.r_[1.0, np.zeros(L - 1), -.48, -.48], np.pad(exc, (0, n - len(exc))))
+        x = sosfilt(_sos("band", [400, 4000], sr), x) * np.exp(-t / .045)
+    elif kind == "piano":    # фортепиано: обертоны с лёгкой негармоничностью, верхние гаснут быстрее
+        x = np.zeros(n)
+        for k in range(1, 9):
+            fk = f * k * np.sqrt(1 + .0004 * k * k)
+            if fk > sr * .45:
+                break
+            x += np.sin(2 * np.pi * fk * t) * np.exp(-t * (.5 + .45 * k) * (f / 260) ** .3) / k ** 1.25
+        x *= np.minimum(1, t / .004)
+        x += np.random.default_rng(int(midi)).standard_normal(n) * np.exp(-t / .006) * .05   # удар молоточка
+    elif kind == "strings_long":   # струнная группа: медленная атака, держит весь аккорд
+        x = sum(_saw(f * 2 ** (c / 1200), t, ph) for c, ph in ((-10, 0), (-3, .2), (4, .5), (11, .8))) / 4
+        x = sosfilt(_sos("low", 3200, sr), x) * np.minimum(1, t / .35) * (1 + .04 * np.sin(2 * np.pi * 5 * t))
     elif kind == "pluck":
         x = sosfilt(_sos("low", min(f * 6, 8000), sr), _saw(f, t)) * np.exp(-t / .22) + .3 * np.sin(w) * np.exp(-t / .3)
     else:                    # арпеджио-синт
@@ -2075,27 +2523,29 @@ def _ping_pong_echo(bus, sr, bpm, amount):
     return bus + wet * amount
 
 
-BEAT_LEVEL_DB = {"lofi": -2.0, "phonk": 1.0, "trap": 0.5, "house": 0.0, "synth": -1.0, "dance": 0.0}
+BEAT_LEVEL_DB = {"disco": 1.0, "lofi": -2.0, "phonk": 1.0, "trap": 0.5, "house": 0.0, "synth": -1.0, "dance": 0.0}
 
 
 def render_beat_mix(y, sr, an, style, *, bed=None, vol=.9, filter_amt=.35, side=.3,
-                    density=.5, new_bass=True, seed=1, scale=1, layers=None, hpss_bed=None):
+                    density=.5, new_bass=True, seed=1, scale=1, layers=None, hpss_bed=None, template=None):
     """Возвращает (новый микс той же длины, что y; инфо для интерфейса).
 
     bed — дорожки после Demucs: {"main": вокал + остальное, "bass": бас}. Без них старый бит
     приглушается фильтром.
     """
     st_ = BEAT_STYLES[style]
+    if style == "template" and template:
+        st_ = dict(st_, name=f"По образцу: {template.get('name', '')}", swing=float(template.get("swing", 0)))
     r = random.Random(seed)
     n, dur = y.shape[1], y.shape[1] / sr
     kit = _Kit(sr, seed)
 
     grid, down_idx, bpm = _beat_grid(an["beats"], an["phase"], dur, scale)
-    mult = 2 if st_["half"] and bpm >= 110 else (.5 if not st_["half"] and bpm < 95 else 1)
+    mult = 2 if st_["half"] and bpm >= 110 else (.5 if not st_["half"] and bpm < 75 else 1)
     bpb = int(4 * mult)                      # долей в такте паттерна: 2, 4 или 8
     start = down_idx % bpb
 
-    A = GENERATORS[style](r, density)
+    A = _gen_template(r, density, template) if style == "template" and template else GENERATORS[style](r, density)
     B = _mutate(r, density, A, style)
     FA, FB = _fill(style, A), _fill(style, B)
 
@@ -2137,7 +2587,7 @@ def render_beat_mix(y, sr, an, style, *, bed=None, vol=.9, filter_amt=.35, side=
                 continue
             root = _root_at(an, t)
             name = ev["i"]
-            if name in ("808", "sub"):
+            if name in ("808", "sub", "dbass"):
                 if new_bass:
                     bass_events.append((t, ev, root))
                 continue
@@ -2165,6 +2615,11 @@ def render_beat_mix(y, sr, an, style, *, bed=None, vol=.9, filter_amt=.35, side=
         midi = 24 + (root + ev["n"]) % 12
         if midi < 31:
             midi += 12
+        midi += 12 * ev.get("oct", 0)
+        if ev["i"] == "dbass":
+            _place(bass_bus, kit.disco_bass(midi, d, ev["v"]), t, 1.0, sr)
+            prev = midi
+            continue
         hard = ev["i"] == "808"
         glide = hard and prev is not None and prev != midi and r.random() < .5
         _place(bass_bus, kit.bass(midi, prev, d, hard, glide, ev["v"]), t, 1.0, sr)
@@ -2178,7 +2633,7 @@ def render_beat_mix(y, sr, an, style, *, bed=None, vol=.9, filter_amt=.35, side=
     fx_bus = np.zeros((2, n), np.float32)
     nrng = np.random.default_rng(seed)
     if lay.get("on"):
-        cfg = LAYER_STYLES[style]
+        cfg = {**LAYER_STYLES[style], **(CHORD_MOODS.get(lay.get("mood") or "auto") or {})}
         # Пэд: аккорд на каждый такт песни, вступает с первого дропа
         if lay.get("pad", 0) > 0:
             pad_bus = np.zeros((2, n), np.float32)
@@ -2205,6 +2660,24 @@ def render_beat_mix(y, sr, an, style, *, bed=None, vol=.9, filter_amt=.35, side=
             keys_bus = np.zeros((2, n), np.float32)
             kind = cfg["keys_type"]
             mode, steps, note_len = KEY_PATTERNS[kind]
+            if kind == "disco":                                # струнные и фанк-гитара по аккордам трека
+                for kk, b0 in bars:
+                    step_sec = (_time_at(grid, b0 + bpb) - _time_at(grid, b0)) / 16
+                    for s_, ln in DISCO_STRINGS:
+                        t = _time_at(grid, b0 + s_ / 16 * bpb)
+                        if 0 <= t < dur - .05 and kk >= 1:
+                            root, minor = _chord_at(an, t)
+                            for v, midi in enumerate(_chord_tones(60 + root - (12 if root > 7 else 0), minor, True)):
+                                _place(keys_bus, _note("strings", midi, ln * step_sec + .25, sr), t, .13, sr, (v - 1.5) * .25)
+                    for j, s_ in enumerate(DISCO_GUITAR):
+                        if r.random() > .7 + .3 * density:
+                            continue
+                        t = _time_at(grid, b0 + s_ / 16 * bpb)
+                        if 0 <= t < dur - .05:
+                            root, minor = _chord_at(an, t)
+                            for midi in _chord_tones(64 + (root + 8) % 12 - 8, minor, False):
+                                _place(keys_bus, _note("gtr", midi, .12, sr), t, .1, sr, .45 if j % 2 else -.45)
+                steps = []
             if style == "phonk":
                 steps = [0, 6, 12] + ([3, 9] if density > .6 else [])
             arp_i = 0
@@ -2216,7 +2689,7 @@ def render_beat_mix(y, sr, an, style, *, bed=None, vol=.9, filter_amt=.35, side=
                     if t < 0 or t >= dur - .05:
                         continue
                     root, minor = _chord_at(an, t)
-                    tail = .5 if kind in ("rhodes", "bell") else .05
+                    tail = .5 if kind in ("rhodes", "bell", "piano") else .05
                     if mode == "chord":
                         base = 48 + root + (12 if 48 + root < 52 else 0)
                         for v, midi in enumerate(_chord_tones(base, minor, cfg["seventh"])):
@@ -2290,6 +2763,10 @@ def render_beat_mix(y, sr, an, style, *, bed=None, vol=.9, filter_amt=.35, side=
         layer_bus = np.stack([mid + sid, mid - sid])
     soft_duck = 1 - (1 - duck) * .7               # слои качаются мягче подложки
     beat_bus = drums + bass_bus
+    if hpss_bed is not None or bed is not None:   # в треке есть голос: освобождаем ему 2–3 кГц
+        carve = _rbj("peak", 2600, sr, -3.0, q=.9)
+        beat_bus = _sosf(carve, beat_bus)
+        layer_bus = _sosf(carve, layer_bus)
     beat_lufs = integrated_lufs(beat_bus, sr)
     if beat_lufs > -69:                           # громкость бита относительно трека
         target = -20.0 + BEAT_LEVEL_DB.get(style, 0.0) + 20 * np.log10(max(vol, 1e-3) / .9)
@@ -2976,41 +3453,8 @@ def run_studio_job(ctx, p):
     y = y[:, i0:i1]
     if y.shape[1] < sr:
         raise RuntimeError("После обрезки трек короче 1 секунды — проверьте «Начать с» и «Закончить на».")
-    y_original = y
-    beat_info, analysis = None, None
     file_key = f"{p['src_hash']}|{p['trim_start']}|{p['trim_end']}"
-
-    if p["beat_on"]:
-        st_a = ctx.stage(.05, .12, "Ищем темп, доли, басовые ноты и аккорды…")
-        analysis = _cached(f"an|{file_key}|{p.get('bpm_hint') or 0}",
-                           lambda: analyze(y, sr, bpm_hint=p.get("bpm_hint") or None))
-        st_a(1)
-        hpss_bed = None
-        if p["drum_removal"] == "hpss":
-            st_h = ctx.stage(.12, .35, "Убираем старые барабаны (без нейросети)…")
-            hpss_bed = _cached(f"hpss|{file_key}",
-                               lambda: remove_drums_hpss(y, sr, progress=st_h).astype(np.float16)).astype(np.float32)
-        ctx.progress(.36, f"Пишем и сводим бит: {BEAT_STYLES[p['style_key']]['name']}…", force=True)
-        y, beat_info = render_beat_mix(
-            y, sr, analysis, p["style_key"], bed=None, vol=p["beat_vol"], filter_amt=p["beat_filter"],
-            side=p["beat_side"], density=p["beat_density"], new_bass=p["beat_bass"], seed=int(p["beat_seed"]),
-            scale=p["beat_scale"], layers=p["layers"], hpss_bed=hpss_bed)
-        s = p["settings"]
-        beat_info["bpm_out"] = beat_info["bpm"] * (s["speed"] if s["link"] else s["tempo"])
-        beat_info["sure"] = bool(analysis.get("sure", True))
-        del hpss_bed
-
-    s = p["settings"]
-    fx_bpm = beat_info["bpm_out"] if beat_info else None
-    if fx_bpm is None and any(p["fx"].get(k, 0) > 0 for k in SYNCED_FX):
-        an = analysis or _cached(f"an|{file_key}|0", lambda: analyze(y_original, sr))
-        fx_bpm = an["tempo"] * (s["speed"] if s["link"] else s["tempo"])
-    amb, amb_name = _ambience_from(p, sr)
-    ctx.progress(.5, "Эффекты, атмосфера и мастеринг…", force=True)
-    y, master_report = process_audio(
-        y, sr, s, p["fx"], fx_bpm or 120.0, master=p["master"],
-        fades=(max(p["fade_in"], .02), max(p["fade_out"], .05)),
-        ambience={"loop": amb, "level_db": p["ambience"]["level_db"]} if amb is not None else None)
+    y, y_original, analysis, beat_info, fx_bpm, master_report, amb_name = studio_audio(ctx, y, sr, p, file_key)
     ctx.progress(.62, "Сохраняем WAV и MP3…", force=True)
     files = _write_audio_files(ctx, y, sr, p["bits"])
     duration = y.shape[1] / sr
@@ -3061,6 +3505,230 @@ def run_studio_job(ctx, p):
             "master": master_report, "beat": beat_info, "fx": active_fx(p["fx"]), "duration": duration,
             "note": ai_note, "ambience": amb_name}
 
+
+RU_NOTES = ["до", "до-диез", "ре", "ре-диез", "ми", "фа", "фа-диез", "соль", "соль-диез", "ля", "ля-диез", "си"]
+KEY_SHIFT_TIPS = {-3: "тёмно и глубоко", -2: "глубже и грустнее, как в slowed", -1: "мягче и теплее",
+                  1: "ярче и энергичнее", 2: "ещё ярче, для sped up и поп", 3: "очень ярко, nightcore"}
+
+
+def key_label(root, minor, long=False):
+    short = NOTE_NAMES[int(root) % 12] + ("m" if minor else "")
+    return f"{short} ({RU_NOTES[int(root) % 12]} {'минор' if minor else 'мажор'})" if long else short
+
+
+def song_key_info(y, sr):
+    """Тональность и темп для подсказок (первые 2,5 минуты хватает)."""
+    an = analyze(y[:, :int(150 * sr)], sr)
+    return {"root": int(an["key"]), "minor": bool(an.get("key_minor", False)), "bpm": float(an["tempo"])}
+
+
+def total_shift(s):
+    """Итоговый сдвиг тона в полутонах при текущих настройках."""
+    base = 12 * np.log2(s["speed"]) if s["link"] else s["pitch"]
+    return base + (HZ432_SEMITONES if s.get("hz432") else 0.0)
+
+
+TONE_MOODS = {
+    "bright": "☀️ Ярко",
+    "sad": "🌧 Грустно",
+    "dance": "💃 Танцевально",
+    "calm": "🌙 Спокойно",
+}
+
+
+def beautiful_tone(mood, minor, bpm):
+    """«Красивая тональность»: сдвиг тона, темп и зал под настроение с учётом лада и темпа песни."""
+    def tempo_to(target, lo, hi):
+        if not bpm:
+            return 1.0
+        cand = min((bpm, bpm * 2, bpm / 2), key=lambda b: abs(np.log(target / b)))
+        return float(np.clip(round(target / cand, 2), lo, hi))
+    if mood == "bright":   # мажор и так светлый — хватает +1; минору нужно +2
+        return {"pitch": 2.0 if minor else 1.0, "tempo": tempo_to(bpm * 1.05 if bpm else 120, 1.0, 1.08), "reverb": .12}
+    if mood == "sad":
+        return {"pitch": -2.0 if minor else -3.0, "tempo": tempo_to(bpm * .9 if bpm else 80, .85, .95), "reverb": .45}
+    if mood == "dance":
+        return {"pitch": 1.0, "tempo": tempo_to(124, .9, 1.15), "reverb": .15}
+    return {"pitch": -1.0, "tempo": tempo_to(85, .85, 1.0), "reverb": .35}
+
+
+def _genre_by_short(short):
+    return next(g for g, v in GENRES.items() if v["short"] == short)
+
+
+RECIPES = {
+    "⚡ Sped Up": dict(genre="Sped Up", preset="Sped Up / Nightcore", link=True, speed=1.2, reverb=.1, beat=False, air=.3,
+                      tip="+3 полутона, ×1,2, без нового бита"),
+    "🌙 Slowed + Reverb": dict(genre="Slowed + Reverb", preset="Slowed & Reverb", link=True, speed=.85, reverb=.55,
+                               vinyl=.15, beat=False, warm=.2, tip="−3 полутона, ×0,85, большой зал"),
+    "🎌 Nightcore": dict(genre="Sped Up", preset="Sped Up / Nightcore", link=True, speed=1.28, reverb=.12, beat=True,
+                        style="dance", chords="club", air=.4, hi=2.0, tip="×1,28, танцевальный бит и плак-синт"),
+    "🖤 Deep / Dark": dict(genre="Slowed + Reverb", preset="Deep / Dark", link=False, tempo=.94, pitch=-3.0,
+                          reverb=.35, bass=.5, beat=True, style="trap", chords="dream", warm=.3, tip="−3 полутона, тёмный трэп"),
+    "✨ Bright Pop": dict(genre="Pop Remix", preset="Bright Pop", link=False, tempo=1.04, pitch=2.0, reverb=.15,
+                         bass=.25, beat=True, style="dance", chords="club", air=.7, hi=3.5, tip="+2 полутона, яркий поп-бит"),
+    "☕ Lo-Fi": dict(genre="Lo-Fi", preset="Lo-Fi Vinyl", link=True, speed=.93, reverb=.25, vinyl=.35, bass=.35,
+                    beat=True, style="lofi", chords="warm", warm=.4, tip="винил, тёплое пианино, мягкий бит"),
+    "🪩 Disco": dict(genre="Disco", preset="Disco", link=False, beat=True, style="disco", retempo=True, air=.45, hi=2.5,
+                    tip="темп танцпола, струнные и фанк-гитара"),
+}
+
+
+def recipe_values(name):
+    """Значения виджетов для рецепта (ключи как у pv/wk)."""
+    r = RECIPES[name]
+    gl = _genre_by_short(r["genre"])
+    base = PRESETS[r["preset"]]
+    k = f"{gl}_{r['preset']}"
+    vals = {"s_genre": gl, f"preset_{gl}": r["preset"], "beat_on": r["beat"], "formant": True, "hz432": False,
+            "m_air": r.get("air", 0.0), "m_warm": r.get("warm", 0.0), "fx_preset": "Без эффектов",
+            "fx_Без эффектов_eq_high": r.get("hi", 0.0)}
+    for f in ("link", "speed", "tempo", "pitch", "reverb", "bass", "vinyl"):
+        vals[f"{f}_{k}"] = r.get(f, base[f])
+    if r["beat"]:
+        style = r["style"]
+        vals[f"beatstyle_{gl}"] = "auto" if style == GENRES[gl]["beat"] else style
+        vals["layers_on"] = True
+        vals["chord_mood"] = r.get("chords", "auto")
+        if r.get("retempo"):
+            vals[f"retempo_{style}"] = True
+    return vals
+
+
+def _loudest_window(y, sr, seconds):
+    """Начало самого яркого (громкого) куска длиной seconds — обычно это припев."""
+    m = np.abs(y).mean(0)
+    sec = m[:len(m) // sr * sr].reshape(-1, sr).mean(1) if len(m) >= sr else m[:1]
+    w = int(seconds)
+    if len(sec) <= w:
+        return 0
+    run = np.convolve(sec, np.ones(w), "valid")
+    lo = int(len(run) * .15)                                   # не берём самое начало (интро)
+    return int(lo + np.argmax(run[lo:])) if len(run) > lo + 1 else int(np.argmax(run))
+
+
+def studio_preview(source_bytes, source_name, p, seconds=20, lead=8):
+    """Быстрая прослушка: тот же звук, что в полной обработке, но на самом ярком куске песни.
+    Возвращает (было MP3, стало MP3, начало куска в секундах). «Было» выровнено по громкости со «стало»."""
+    with tempfile.NamedTemporaryFile(suffix=Path(source_name).suffix or ".mp3") as tf:
+        tf.write(source_bytes)
+        tf.flush()
+        y, sr = load_audio(tf.name)
+    if y.shape[0] == 1:
+        y = np.repeat(y, 2, axis=0)
+    i0 = int(p["trim_start"] * sr)
+    i1 = int(p["trim_end"] * sr) if p["trim_end"] else y.shape[1]
+    y = y[:, i0:i1]
+    win = seconds + lead
+    start = _loudest_window(y, sr, win)
+    exc = y[:, start * sr:(start + win) * sr]
+    del y
+    q = {**p, "fade_in": .02, "fade_out": .3, "ai": None,
+         "tpl_opts": {**(p.get("tpl_opts") or {}), "chorus": False}}
+    if (q.get("ambience") or {}).get("kind") == "custom":
+        q["ambience"] = {"kind": None, "level_db": -18}
+    key = f"{p['src_hash']}|pv|{p['trim_start']}|{p['trim_end']}|{start}"
+    out, _, _, _, _, _, _ = studio_audio(_NullCtx(), exc, sr, q, key)
+    n = int(seconds * sr)
+    after = out[:, -n:] if out.shape[1] > n else out
+    ratio = exc.shape[1] / max(1, out.shape[1])                  # во сколько раз изменилась длина
+    nb = min(exc.shape[1], int(after.shape[1] * ratio))
+    before = exc[:, -nb:]
+    gain = 10 ** ((integrated_lufs(after, sr) - integrated_lufs(before, sr)) / 20)
+    before = np.clip(before * gain, -.98, .98)
+    fade = np.minimum(1, np.arange(after.shape[1]) / (.03 * sr))
+    after = after * fade * fade[::-1]
+    fb = np.minimum(1, np.arange(before.shape[1]) / (.03 * sr))
+    before = before * fb * fb[::-1]
+    return encode_audio(before, sr, "MP3"), encode_audio(after, sr, "MP3"), i0 / sr + start + lead
+
+
+class _NullCtx:
+    """Заглушка прогресса для быстрой прослушки (без фоновой задачи)."""
+    def progress(self, *a, **k):
+        pass
+
+    def stage(self, *a, **k):
+        return lambda *x, **y: None
+
+
+def studio_audio(ctx, y, sr, p, file_key):
+    """Звуковая часть студии: анализ → новый бит и слои → тон и темп → эффекты → мастеринг.
+    Общая для полной обработки и для прослушки 20 секунд — звучит одинаково."""
+    y_original = y
+    beat_info, analysis = None, None
+    p = {**p, "settings": dict(p["settings"])}
+
+    if p["beat_on"]:
+        st_a = ctx.stage(.05, .12, "Ищем темп, доли, басовые ноты и аккорды…")
+        analysis = _cached(f"an|{file_key}|{p.get('bpm_hint') or 0}",
+                           lambda: analyze(y, sr, bpm_hint=p.get("bpm_hint") or None))
+        st_a(1)
+        tpl = p.get("template") if p["style_key"] == "template" else None
+        topt = p.get("tpl_opts") or {}
+        if tpl and topt.get("tempo", True):                  # темп задаёт образец — скорость пресета не добавляем
+            p["settings"] = {**p["settings"], "speed": 1.0, "tempo": 1.0}
+        if tpl and topt.get("chorus"):                       # как у диджеев: ремикс начинается с припева
+            ctx.progress(.1, "Ищем припев…", force=True)
+            start = find_chorus(y, sr, analysis)
+            if start > 1.0 and y.shape[1] / sr - start > 45:
+                y = y[:, int((start - .05) * sr):]
+                y_original = y
+                file_key += f"|ch{start:.2f}"
+                analysis = _cached(f"an|{file_key}", lambda: analyze(y, sr))
+        hpss_bed = None
+        if p["drum_removal"] == "hpss":
+            st_h = ctx.stage(.12, .35, "Убираем старые барабаны (без нейросети)…")
+            hpss_bed = _cached(f"hpss|{file_key}",
+                               lambda: remove_drums_hpss(y, sr, progress=st_h).astype(np.float16)).astype(np.float32)
+        beat_scale, retempo_note = p["beat_scale"], None
+        tcfg = None
+        if tpl and topt.get("tempo", True):
+            t_ = float(tpl["tempo"])
+            tcfg = (t_ * .98, t_ * 1.02, t_)
+        if tcfg or (p.get("retempo") and BEAT_STYLES[p["style_key"]].get("retempo")):
+            src_bpm = analysis["tempo"]
+            m, rate, target = retempo_plan(src_bpm, p["style_key"], None if tcfg else p.get("retempo_bpm"), cfg=tcfg)
+            if abs(rate - 1) > .01:
+                ctx.progress(.36, f"Меняем темп {src_bpm:.0f} → {target:.0f} BPM без изменения тона…", force=True)
+                y = stretch_tempo(y, sr, rate)
+                if hpss_bed is not None:
+                    hpss_bed = stretch_tempo(hpss_bed, sr, rate)
+                analysis = scale_analysis(analysis, rate)
+            beat_scale = m
+            retempo_note = f"{src_bpm:.0f} → {target:.0f} BPM"
+        ctx.progress(.4, f"Пишем и сводим бит: {BEAT_STYLES[p['style_key']]['name']}…", force=True)
+        y, beat_info = render_beat_mix(
+            y, sr, analysis, p["style_key"], bed=None, vol=p["beat_vol"], filter_amt=p["beat_filter"],
+            side=p["beat_side"], density=p["beat_density"], new_bass=p["beat_bass"], seed=int(p["beat_seed"]),
+            scale=beat_scale, layers=p["layers"], hpss_bed=hpss_bed, template=tpl)
+        beat_info["retempo"] = retempo_note
+        if tpl:
+            beat_info["template"] = tpl.get("name")
+        s = p["settings"]
+        beat_info["bpm_out"] = beat_info["bpm"] * (s["speed"] if s["link"] else s["tempo"])
+        beat_info["sure"] = bool(analysis.get("sure", True))
+        del hpss_bed
+
+    s = p["settings"]
+    fx_bpm = beat_info["bpm_out"] if beat_info else None
+    if fx_bpm is None and any(p["fx"].get(k, 0) > 0 for k in SYNCED_FX):
+        an = analysis or _cached(f"an|{file_key}|0", lambda: analyze(y_original, sr))
+        fx_bpm = an["tempo"] * (s["speed"] if s["link"] else s["tempo"])
+    amb, amb_name = _ambience_from(p, sr)
+    ctx.progress(.5, "Эффекты, атмосфера и мастеринг…", force=True)
+    tpl = p.get("template") if p["beat_on"] and p["style_key"] == "template" else None
+    topt = p.get("tpl_opts") or {}
+    match, master = None, p["master"]
+    if tpl and topt.get("sound", True):
+        match = {"curve": tpl["curve"], "width": tpl["width"], "amount": .8}
+    if tpl and topt.get("loud", True) and master:
+        master = {**master, "lufs": float(np.clip(tpl["lufs"], -14, -8))}
+    y, master_report = process_audio(
+        y, sr, s, p["fx"], fx_bpm or 120.0, master=master, match=match,
+        fades=(max(p["fade_in"], .02), max(p["fade_out"], .05)),
+        ambience={"loop": amb, "level_db": p["ambience"]["level_db"]} if amb is not None else None)
+    return y, y_original, analysis, beat_info, fx_bpm, master_report, amb_name
 
 def run_long_job(ctx, p):
     """Версия на 30 мин – 3 часа: плавные стыки, непрерывная атмосфера, быстрое видео, SEO «1 Hour»."""
@@ -3177,6 +3845,10 @@ def delete_preset(username, name):
 # =====================================================================
 
 NAME_BANK = {
+    "disco": {"a": ["Mirror", "Disco", "Golden", "Velvet", "Funky", "Neon", "Groove", "Glitter", "Midnight", "Roller"],
+              "b": ["Ball", "Fever", "Nights", "Club", "Machine", "Party", "Groove", "Palace", "Lights", "Dancers"],
+              "p": ["Nu-Disco Hits {year} 🪩", "Disco Remixes of Popular Songs", "Friday Night Disco Party",
+                    "Disco House Mix — {n} Hour", "Funky Disco Grooves for {mood} Nights"]},
     "lofi": {"a": ["Rainy", "Sleepy", "Dusty", "Cozy", "Midnight", "Velvet", "Paper", "Quiet", "Warm", "Foggy"],
              "b": ["Tapes", "Beats", "Café", "Window", "Library", "Notebook", "Cassette", "Room", "Vinyl", "Lamp"],
              "p": ["Rainy {day} Lo-Fi to Study & Relax", "Lo-Fi Beats for {mood} Nights", "{n} Hours of Cozy Lo-Fi",
@@ -3231,6 +3903,7 @@ def generate_names(style, seed, count=8):
 # =====================================================================
 
 NICHE_QUERIES = {
+    "disco": ["disco remix", "nu disco", "disco house mix", "disco remix {year}", "funky disco"],
     "lofi": ["lofi hip hop", "lofi rain", "lofi study music", "lofi sleep 1 hour", "lofi beats {year}"],
     "slowed": ["slowed reverb", "slowed and reverb 1 hour", "sad slowed songs", "slowed tiktok songs", "slowed {year}"],
     "phonk": ["phonk", "drift phonk", "brazilian phonk", "phonk 1 hour", "gym phonk {year}"],
@@ -3416,6 +4089,8 @@ AI_STYLE_PROMPTS = {
              "shimmering hi-hats, warm pads",
     "synth": "synthwave remix, gated reverb snare, retro analog arpeggios, lush 80s pads, driving bassline",
     "dance": "energetic sped up dance remix, punchy four on the floor drums, bright plucks, uplifting supersaw chords",
+    "disco": "nu-disco remix, four on the floor kick, octave disco bassline, funky muted guitar, lush string stabs, "
+             "open hi-hats, groovy dance floor energy",
 }
 
 
@@ -3488,7 +4163,7 @@ GEN_MOODS = {
     "Агрессивный": "aggressive, hard-hitting, intense",
     "Романтичный": "romantic, warm, intimate",
 }
-GEN_BPM = {"lofi": 80, "phonk": 130, "trap": 140, "house": 122, "synth": 105, "dance": 128}
+GEN_BPM = {"disco": 120, "lofi": 80, "phonk": 130, "trap": 140, "house": 122, "synth": 105, "dance": 128}
 
 
 def build_gen_prompt(style, mood, bpm, extra=""):
@@ -3827,6 +4502,22 @@ def render_studio(username, api_key, ai_mode):
                                  label_visibility="collapsed")
         save_clicked = c2.button("💾 Сохранить текущие настройки", key="preset_save")
 
+    # Рецепты в одну кнопку
+    with st.container(border=True):
+        st.markdown("**⚡ Рецепты в одну кнопку** — сразу выставляют тональность, темп, зал, бит и аккорды")
+        names = list(RECIPES)
+        for row in (names[:4], names[4:]):
+            cols = st.columns(4)
+            for col, name in zip(cols, row):
+                if col.button(name, key=f"recipe_{name}", help=RECIPES[name]["tip"], width="stretch"):
+                    apply_preset({**collect_preset(), **recipe_values(name)})
+                    st.session_state["recipe_done"] = name
+                    st.rerun()
+        done = st.session_state.pop("recipe_done", None)
+        if done:
+            st.success(f"Рецепт «{done}» применён: {RECIPES[done]['tip']}. Можно послушать 20 секунд внизу или "
+                       "подправить ползунки.")
+
     # Шаг 2. Релиз и обложка
     with st.container(border=True):
         step_title(2, "🎨 Релиз и обложка")
@@ -3834,7 +4525,21 @@ def render_studio(username, api_key, ai_mode):
 
     # Шаг 3. Скорость и звучание
     with st.container(border=True):
-        step_title(3, "🎛️ Скорость и звучание")
+        step_title(3, "🎛️ Тональность, скорость и звучание")
+        ki = st.session_state.get("keyinfo")
+        if not ki or ki[0] != src_hash:
+            with st.spinner("Определяем тональность и темп песни…"):
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=Path(source_name).suffix or ".mp3") as tf:
+                        tf.write(source_bytes)
+                        tf.flush()
+                        y0, sr0 = load_audio(tf.name)
+                    ki = (src_hash, song_key_info(y0, sr0))
+                    del y0
+                except Exception:
+                    ki = (src_hash, None)
+            st.session_state["keyinfo"] = ki
+        song_key = ki[1]
         preset_names = list(PRESETS)
         preset_name = st.selectbox("Пресет", preset_names, key=wk(f"preset_{genre_label}"),
                                    index=pidx(preset_names, f"preset_{genre_label}", genre["preset"]))
@@ -3856,20 +4561,109 @@ def render_studio(username, api_key, ai_mode):
             bass = st.slider("Усиление баса", 0.0, 1.0, float(pv(f"bass_{k}", p["bass"])), 0.05, key=wk(f"bass_{k}"))
             vinyl = st.slider("Винил (тепло, шипение, щелчки)", 0.0, 1.0, float(pv(f"vinyl_{k}", p["vinyl"])), 0.05,
                               key=wk(f"vinyl_{k}"))
-    settings = dict(link=link, speed=speed, tempo=tempo, pitch=pitch, reverb=reverb, bass=bass, vinyl=vinyl)
+        c1, c2 = st.columns(2)
+        formant = c1.checkbox("🗣 Живой голос при смене тона", value=pv("formant", True), key=wk("formant"),
+                              help="Ноты сдвигаются, а тембр голоса остаётся своим: без «бурундука» при +3…+4 "
+                                   "и без «великана» при −3…−4.")
+        hz432 = c2.checkbox("🎼 Строй 432 Гц", value=pv("hz432", False), key=wk("hz432"),
+                            help="Опускает строй с 440 до 432 Гц (на треть полутона) — популярно для музыки "
+                                 "для сна, медитации и расслабления.")
+        settings = dict(link=link, speed=speed, tempo=tempo, pitch=pitch, reverb=reverb, bass=bass, vinyl=vinyl,
+                        formant=formant, hz432=hz432)
+        if song_key:
+            root, minor = song_key["root"], song_key["minor"]
+            sh = total_shift(settings)
+            shr = int(round(sh))
+            st.markdown(f"🎼 **Тональность песни: {key_label(root, minor, True)}** · темп ≈ {song_key['bpm']:.0f} BPM")
+            tips = " · ".join(f"**{d:+d}** → {key_label(root + d, minor)} — {t}" for d, t in KEY_SHIFT_TIPS.items()
+                              if d in (-2, -1, 1, 2))
+            st.caption("Куда сдвинуть: " + tips)
+            if abs(sh) >= .05:
+                approx = "≈ " if abs(sh - shr) > .1 else ""
+                st.caption(f"С текущими настройками: {key_label(root, minor)} → **{approx}{key_label(root + shr, minor)}** "
+                           f"({sh:+.1f} полутона)" + (" · строй 432 Гц" if hz432 else ""))
+            st.markdown("**✨ Красивая тональность** — сайт сам подберёт сдвиг, темп и зал под настроение:")
+            cols = st.columns(len(TONE_MOODS))
+            for col, (mk, ml) in zip(cols, TONE_MOODS.items()):
+                if col.button(ml, key=f"tone_{mk}", width="stretch"):
+                    t = beautiful_tone(mk, minor, song_key["bpm"])
+                    vals = {**collect_preset(), f"link_{k}": False, f"tempo_{k}": t["tempo"],
+                            f"pitch_{k}": t["pitch"], f"reverb_{k}": t["reverb"], "formant": True}
+                    apply_preset(vals)
+                    st.session_state["tone_done"] = (ml, t)
+                    st.rerun()
+            done = st.session_state.pop("tone_done", None)
+            if done:
+                ml, t = done
+                st.success(f"{ml}: тон {t['pitch']:+.0f} → {key_label(root + int(t['pitch']), minor)}, "
+                           f"темп ×{t['tempo']:.2f}, зал {t['reverb']:.2f}. Голос остаётся живым.")
+        else:
+            st.caption("Тональность определить не получилось — настройте тон вручную в «Тонкой настройке».")
 
     # Шаг 4. Новый бит и слои
     with st.container(border=True):
         step_title(4, "🥁 Новый бит и музыкальные слои")
         beat_on = st.checkbox("Сделать новый бит", value=pv("beat_on", True), key=wk("beat_on"),
                               help="Находит доли трека с точностью до миллисекунд и пишет под них свой ритм.")
+        my_styles = list_styles(username)
         style_labels = {"auto": f"Как у жанра — {BEAT_STYLES[genre['beat']]['name']}"}
-        style_labels.update({key: s_["name"] for key, s_ in BEAT_STYLES.items()})
+        style_labels.update({f"tpl:{n}": f"🎯 Как образец: {n}" for n in my_styles})
+        style_labels.update({key: s_["name"] for key, s_ in BEAT_STYLES.items() if key != "template"})
         opts = list(style_labels)
         style_choice = st.selectbox("Стиль бита", opts, format_func=style_labels.get, disabled=not beat_on,
                                     key=wk(f"beatstyle_{genre_label}"), index=pidx(opts, f"beatstyle_{genre_label}", "auto"))
-        style_key = genre["beat"] if style_choice == "auto" else style_choice
+        template, tpl_opts = None, {}
+        if style_choice.startswith("tpl:") and style_choice[4:] in my_styles:
+            style_key, template = "template", my_styles[style_choice[4:]]
+        else:
+            style_key = genre["beat"] if style_choice in ("auto",) or style_choice.startswith("tpl:") else style_choice
         bst = BEAT_STYLES[style_key]
+        with st.expander("🎯 Ремикс по образцу — покажите готовый ремикс, и сайт сделает так же с любой песней",
+                         expanded=template is not None):
+            if template is not None and beat_on:
+                st.caption(f"Образец «{template['name']}»: {template['tempo']:.0f} BPM, громкость "
+                           f"{template['lufs']:.0f} LUFS, стерео {template['width']:.2f}")
+                c1, c2 = st.columns(2)
+                tpl_opts = dict(
+                    tempo=c1.checkbox("Темп как у образца (голос не меняется)", value=True, key="tpl_tempo"),
+                    sound=c1.checkbox("Тембр и ширина как у образца", value=True, key="tpl_sound",
+                                      help="Сайт подгоняет баланс низов, середины и верхов и ширину стерео под образец."),
+                    loud=c2.checkbox("Громкость как у образца", value=True, key="tpl_loud"),
+                    chorus=c2.checkbox("Начать с припева", value=False, key="tpl_chorus",
+                                       help="Как в клубных ремиксах: трек начинается с самой яркой части песни."))
+                if st.button(f"🗑 Удалить образец «{template['name']}»", key="tpl_del"):
+                    delete_style(username, template["name"])
+                    st.rerun()
+                st.divider()
+            st.caption("Загрузите ремикс, который нравится: сайт изучит его темп, рисунок бочки, снейра, хэтов и баса, "
+                       "тембр и громкость. Образец сохранится и появится в списке «Стиль бита». Сам образец в новый "
+                       "трек не попадает — копируется только манера.")
+            ref_file = st.file_uploader("Готовый ремикс-образец", type=["mp3", "wav", "ogg", "flac", "m4a"], key="tpl_file")
+            c1, c2 = st.columns([3, 2])
+            ref_name = c1.text_input("Название образца", key="tpl_name", placeholder="Клубный ремикс 110",
+                                     label_visibility="collapsed")
+            if c2.button("🧠 Изучить образец", key="tpl_learn", disabled=ref_file is None):
+                name = (ref_name.strip() or Path(ref_file.name).stem)[:60]
+                with st.spinner("Слушаем образец: темп, рисунок бита, тембр… (около минуты)"):
+                    with tempfile.NamedTemporaryFile(suffix=Path(ref_file.name).suffix or ".mp3") as tf:
+                        tf.write(ref_file.getvalue())
+                        tf.flush()
+                        yr, srr = load_audio(tf.name)
+                    yr = yr[:, :int(240 * srr)]
+                    try:
+                        tpl_new = extract_style(yr, srr, name)
+                    finally:
+                        del yr
+                save_style(username, tpl_new)
+                st.session_state["tpl_learned"] = tpl_new
+                st.rerun()
+            learned = st.session_state.get("tpl_learned")
+            if learned:
+                bar = lambda v: "".join("█" if x >= .8 else "▓" if x >= .55 else "·" for x in v)
+                st.success(f"Образец «{learned['name']}» изучен и сохранён: {learned['tempo']:.0f} BPM. "
+                           "Выберите его в списке «Стиль бита».")
+                st.code(f"бочка  {bar(learned['kick'])}\nснейр  {bar(learned['snare'])}\n"
+                        f"хэты   {bar(learned['hat'])}\nбас    {bar(learned['bass'])}", language=None)
         kb = f"{genre_label}_{style_key}"
         rm_opts = ["hpss", "filter"]
         drum_removal = st.radio("Старые барабаны трека", rm_opts, horizontal=True, key=wk("drum_rm"),
@@ -3877,6 +4671,15 @@ def render_studio(username, api_key, ai_mode):
                                 format_func={"hpss": "Убрать (рекомендуется)", "filter": "Только приглушить"}.get,
                                 help="«Убрать» вырезает удары и оставляет мелодию, аккорды и вокал — новый бит "
                                      "не спорит со старым. «Приглушить» — мягкий фильтр, звучит ближе к оригиналу.")
+        retempo, retempo_bpm = False, None
+        if bst.get("retempo") and beat_on:
+            lo, hi, ideal = bst["retempo"]
+            c1, c2 = st.columns([3, 2])
+            retempo = c1.checkbox("Подогнать темп песни под стиль (голос не меняется)", value=pv(f"retempo_{style_key}", True),
+                                  key=wk(f"retempo_{style_key}"),
+                                  help="Медленную песню ускорит, быструю замедлит — до темпа танцпола. Тон голоса сохраняется.")
+            retempo_bpm = c2.slider("Темп, BPM", lo, hi, int(pv(f"retempo_bpm_{style_key}", ideal)), 1,
+                                    key=wk(f"retempo_bpm_{style_key}"), disabled=not retempo)
         with st.expander("Настройки бита"):
             beat_vol = st.slider("Громкость бита относительно трека", 0.3, 1.5, float(pv(f"bvol_{kb}", .9)), 0.05,
                                  key=wk(f"bvol_{kb}"), help="0,9 — сбалансировано: бит и музыка на одной громкости.")
@@ -3900,11 +4703,18 @@ def render_studio(username, api_key, ai_mode):
             c2.button("🎲 Другая", key="seed_btn",
                       on_click=lambda: st.session_state.update({seed_key: random.randint(1, 99999)}))
         beat_scale = {"Как найден": 1, "½× (в 2 раза медленнее)": 0.5}.get(tempo_choice, 2)
-        lst = LAYER_STYLES[style_key]
         keys_names = {"rhodes": "электропиано", "bell": "колокольчики", "organ": "хаус-орган",
-                      "arp": "арпеджио-синт", "pluck": "плак-синт"}
-        layers_on = st.checkbox("🎹 Музыкальные слои по аккордам трека", value=pv("layers_on", True), key=wk("layers_on"),
-                                disabled=not beat_on)
+                      "arp": "арпеджио-синт", "pluck": "плак-синт", "disco": "струнные и фанк-гитара",
+                      "piano": "фортепиано", "strings_long": "струнные"}
+        c1, c2 = st.columns([3, 2])
+        layers_on = c1.checkbox("🎹 Красивые аккорды поверх песни (в её тональности)", value=pv("layers_on", True),
+                                key=wk("layers_on"), disabled=not beat_on)
+        mood_opts = list(CHORD_MOODS)
+        chord_mood = c2.selectbox("Настроение аккордов", mood_opts, key=wk("chord_mood"),
+                                  index=pidx(mood_opts, "chord_mood", "auto"), disabled=not (beat_on and layers_on),
+                                  format_func=lambda m: "Как у стиля бита" if m == "auto" else CHORD_MOODS[m]["name"])
+        lst = {**LAYER_STYLES[style_key], **(CHORD_MOODS[chord_mood] or {})}
+        kb = f"{kb}_{chord_mood}"
         with st.expander("Слои, переходы и сведение"):
             layer_pad = st.slider("Аккорды (пэд)", 0.0, 1.0, float(pv(f"lpad_{kb}", lst["pad"])), 0.05, key=wk(f"lpad_{kb}"))
             layer_keys = st.slider(f"Клавиши: {keys_names[lst['keys_type']]}", 0.0, 1.0, float(pv(f"lkeys_{kb}", lst["keys"])),
@@ -3914,7 +4724,7 @@ def render_studio(username, api_key, ai_mode):
                                    key=wk(f"lfx_{kb}"))
             layer_polish = st.checkbox("Склейка и широкое стерео слоёв", value=pv(f"lpol_{kb}", True), key=wk(f"lpol_{kb}"))
         layers = dict(on=beat_on and layers_on, pad=layer_pad, keys=layer_keys, echo=layer_echo, fx=layer_fx,
-                      polish=layer_polish)
+                      polish=layer_polish, mood=chord_mood)
 
     # Шаг 5. Эффекты
     with st.container(border=True):
@@ -4025,6 +4835,38 @@ def render_studio(username, api_key, ai_mode):
             save_preset(username, new_name, collect_preset())
             st.success(f"Пресет «{new_name.strip()}» сохранён — он появится в списке «Мои пресеты».")
 
+    params = dict(
+            genre_label=genre_label, title=song_title, artist=artist_name, genre_text=genre_text, label=p["label"],
+            src_hash=hashlib.md5(source_bytes).hexdigest(), trim_start=trim_start, trim_end=trim_end,
+            beat_on=beat_on, bpm_hint=bpm_hint or None, drum_removal=drum_removal, style_key=style_key,
+            beat_vol=beat_vol, beat_filter=beat_filter, beat_side=beat_side, beat_density=beat_density,
+            beat_bass=beat_bass, beat_seed=int(beat_seed), beat_scale=beat_scale, layers=layers,
+            retempo=retempo, retempo_bpm=retempo_bpm, template=template, tpl_opts=tpl_opts,
+            settings=settings, fx=fx, master=dict(on=master_on, target=m_target, glue=m_glue, mono_bass=m_mono,
+                                                  warmth=m_warm, air=m_air),
+            fade_in=fade_in, fade_out=fade_out, bits=24 if wav24 else 16,
+            ambience={"kind": None if amb_kind == "none" else amb_kind, "level_db": amb_level},
+            ai=ai, video={kk: vv for kk, vv in video.items() if kk != "logo"})
+
+    with st.container(border=True):
+        st.markdown("**🎧 Прослушать 20 секунд перед запуском** — тот же звук, что получится, на самом ярком куске песни")
+        if st.button("🎧 Прослушать «было / стало»", key="preview_btn", width="stretch",
+                     disabled=bool(trim_end and trim_end <= trim_start)):
+            with st.spinner("Готовим 20 секунд с вашими настройками (обычно 10–30 секунд)…"):
+                try:
+                    st.session_state["preview"] = (src_hash,) + studio_preview(source_bytes, source_name, params)
+                except Exception as err:
+                    st.session_state.pop("preview", None)
+                    st.error(f"Прослушка не получилась: {err}")
+        pr = st.session_state.get("preview")
+        if pr and pr[0] == src_hash:
+            c1, c2 = st.columns(2)
+            c1.caption(f"Было (с {fmt_ts(pr[3])}, громкость выровнена для честного сравнения)")
+            c1.audio(pr[1], format="audio/mpeg")
+            c2.caption("Стало")
+            c2.audio(pr[2], format="audio/mpeg")
+            st.caption("Поменяли настройки — нажмите «Прослушать» ещё раз.")
+
     if st.button("🚀 Создать трек, обложку, видео и SEO", type="primary", width="stretch"):
         if not song_title.strip():
             st.warning("Введите название трека.")
@@ -4035,17 +4877,6 @@ def render_studio(username, api_key, ai_mode):
         if amb_kind == "custom" and amb_file is None:
             st.warning("Загрузите файл атмосферы или выберите другую.")
             return
-        params = dict(
-            genre_label=genre_label, title=song_title, artist=artist_name, genre_text=genre_text, label=p["label"],
-            src_hash=hashlib.md5(source_bytes).hexdigest(), trim_start=trim_start, trim_end=trim_end,
-            beat_on=beat_on, bpm_hint=bpm_hint or None, drum_removal=drum_removal, style_key=style_key,
-            beat_vol=beat_vol, beat_filter=beat_filter, beat_side=beat_side, beat_density=beat_density,
-            beat_bass=beat_bass, beat_seed=int(beat_seed), beat_scale=beat_scale, layers=layers,
-            settings=settings, fx=fx, master=dict(on=master_on, target=m_target, glue=m_glue, mono_bass=m_mono,
-                                                  warmth=m_warm, air=m_air),
-            fade_in=fade_in, fade_out=fade_out, bits=24 if wav24 else 16,
-            ambience={"kind": None if amb_kind == "none" else amb_kind, "level_db": amb_level},
-            ai=ai, video={kk: vv for kk, vv in video.items() if kk != "logo"})
 
         def prepare(ctx):
             src = ctx.path("source" + (Path(source_name).suffix.lower() or ".mp3"))
@@ -4222,6 +5053,10 @@ def render_cabinet(username):
             beat = r.get("beat")
             if beat:
                 timing = {2: " · half-time", 0.5: " · double-time"}.get(beat["mult"], "")
+                if beat.get("retempo"):
+                    st.markdown(f"**⏩ Темп песни:** {beat['retempo']} (тон голоса сохранён)")
+                if beat.get("template"):
+                    st.markdown(f"**🎯 По образцу:** {beat['template']}")
                 st.markdown(f"**🥁 Новый бит:** {beat['style']}{timing} · {beat['bpm_out']:.1f} BPM · "
                             f"бас трека {beat['key']}" + (f" · аккорды {beat['chords']}" if beat.get("chords") else ""))
                 if not beat.get("sure", True):
