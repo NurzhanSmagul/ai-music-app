@@ -144,6 +144,7 @@ def init_db():
                             PRIMARY KEY (username, name)
                         )""")
         conn.execute("CREATE TABLE IF NOT EXISTS yt_cache (q TEXT PRIMARY KEY, ts REAL, data TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS auth_tokens (token TEXT PRIMARY KEY, username TEXT, expires REAL)")
     with closing(get_conn()) as conn:
         try:
             conn.execute("PRAGMA journal_mode=WAL")      # чтение не блокирует запись
@@ -248,6 +249,41 @@ def register_user(username, password):
     except sqlite3.IntegrityError:
         return "Такой логин уже занят."
     return None
+
+
+LOGIN_DAYS = 30
+
+
+def _token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()    # в базе только хэш — утечка базы не даёт войти
+
+
+def create_login_token(username):
+    """«Запомнить меня»: после перезагрузки страницы или обрыва связи вход восстанавливается сам."""
+    import time as _t
+    token = secrets.token_urlsafe(24)
+    with closing(get_conn()) as conn, conn:
+        conn.execute("DELETE FROM auth_tokens WHERE expires < ?", (_t.time(),))
+        conn.execute("INSERT INTO auth_tokens (token, username, expires) VALUES (?, ?, ?)",
+                     (_token_hash(token), username, _t.time() + LOGIN_DAYS * 86400))
+    return token
+
+
+def user_from_token(token):
+    import time as _t
+    if not token or len(token) > 100:
+        return None
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT t.username FROM auth_tokens t JOIN users u ON u.username = t.username "
+                           "WHERE t.token = ? AND t.expires > ? AND u.is_active = 1",
+                           (_token_hash(token), _t.time())).fetchone()
+    return row[0] if row else None
+
+
+def delete_login_token(token):
+    if token:
+        with closing(get_conn()) as conn, conn:
+            conn.execute("DELETE FROM auth_tokens WHERE token = ?", (_token_hash(token),))
 
 
 def verify_user(username, password):
@@ -3517,8 +3553,8 @@ def key_label(root, minor, long=False):
 
 
 def song_key_info(y, sr):
-    """Тональность и темп для подсказок (первые 2,5 минуты хватает)."""
-    an = analyze(y[:, :int(150 * sr)], sr)
+    """Тональность и темп для подсказок (первых полутора минут хватает, памяти нужно мало)."""
+    an = analyze(y[:, :int(90 * sr)], sr)
     return {"root": int(an["key"]), "minor": bool(an.get("key_minor", False)), "bpm": float(an["tempo"])}
 
 
@@ -4053,7 +4089,9 @@ def render_auth():
             password = st.text_input("Пароль", type="password")
             if st.form_submit_button("Войти", type="primary"):
                 if verify_user(user, password):
-                    st.session_state.update(logged_in=True, username=user.strip())
+                    token = create_login_token(user.strip())
+                    st.session_state.update(logged_in=True, username=user.strip(), auth_token=token)
+                    st.query_params["s"] = token
                     st.rerun()
                 else:
                     st.error("Неверный логин или пароль.")
@@ -5199,12 +5237,23 @@ def main():
     st.session_state.setdefault("username", "")
 
     if not st.session_state["logged_in"]:
-        render_auth()
-        st.stop()
+        token = st.query_params.get("s")            # связь оборвалась или страница перезагрузилась — входим сами
+        restored = user_from_token(token)
+        if restored:
+            st.session_state.update(logged_in=True, username=restored, auth_token=token)
+        else:
+            if token:
+                del st.query_params["s"]
+            render_auth()
+            st.stop()
+    elif st.session_state.get("auth_token") and st.query_params.get("s") != st.session_state["auth_token"]:
+        st.query_params["s"] = st.session_state["auth_token"]   # ссылка в адресной строке всегда с входом
 
     username = st.session_state["username"]
     user = get_user(username)
     if not user or not user["is_active"]:
+        delete_login_token(st.session_state.get("auth_token"))
+        st.query_params.clear()
         for key in list(st.session_state.keys()):
             del st.session_state[key]
         st.error("Аккаунт заблокирован или удалён. Обратитесь к администратору.")
@@ -5229,6 +5278,8 @@ def main():
             st.text_input("API-ключ", type="password", key="own_key", help="platform.stability.ai → API Keys")
             st.caption("Со своим ключом генерации не списываются с баланса: платит ваш счёт Stability.")
         if st.button("🚪 Выйти"):
+            delete_login_token(st.session_state.get("auth_token"))
+            st.query_params.clear()
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
             st.rerun()
